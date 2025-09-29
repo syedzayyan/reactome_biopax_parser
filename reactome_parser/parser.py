@@ -1,9 +1,5 @@
-import argparse
-import os.path
-import re
 import xml.etree.ElementTree as ET
 import networkx as nx
-import requests 
 import pandas as pd
 
 namespaces = {
@@ -26,15 +22,6 @@ class ReactomeBioPAX():
         self.reactions = None
         self.reactionOrder = None
 
-    def download_list_of_pathways(save_dir: str = "./"):
-        res = requests.get('https://reactome.org/download/current/ReactomePathways.txt')
-        if res.ok:
-            with open(f"{save_dir}list_of_pathways.txt", mode="wb") as file:
-                file.write(res.content)
-
-    def download_biopax_file(save_dir: str = "./"):
-        list_of_pathways = pd.read_csv(f"./data/list_of_pathways.txt", delimiter="\t", names = ["id", "name", "species"])
-
     def parse_biopax3_file(self, filename: str, hypergraph: bool = False):
         self.tree = ET.parse(filename)
         self.hypergraph = hypergraph
@@ -42,22 +29,27 @@ class ReactomeBioPAX():
         self.uniXrefs = self.__parse_unixrefs()
         self.cellularLocations = self.__parse_cellular_location()
 
-        self.molecules = self.__parse_molecules()
+        self.__parse_molecules()
         self.proteins = self.__parse_proteins()
         self.complexes = self.__parse_protein_complexes()
 
         self.reactions = self.__parse_reactions()
         self.reactionOrder = self.__parse_reaction_order()
+        self.__physical_entity()
 
     def __parse_molecules(self):
-        molecules = {}
+        self.molecules = {}
         for compounds in self.tree.findall("biopax:SmallMolecule", namespaces):
             moleculesID = compounds.get(ID_RDF_STRING)
             disName = compounds.find("biopax:displayName", namespaces).text
             aliases = [nm.text for nm in compounds.findall("biopax:name", namespaces)]
             comment = compounds.find("biopax:comment", namespaces).text
-            molecules[moleculesID] = (disName, aliases, comment)
-        return molecules
+            self.molecules[moleculesID] = {
+                "name": disName, 
+                "aliases": aliases, 
+                "comment": comment,
+                "color": "red"
+            }
         
     def __parse_cellular_location(self):
         cellularLocations = {}
@@ -80,11 +72,14 @@ class ReactomeBioPAX():
             if len(complexity) > 0:
                 for complex in complexity:  
                     complexes.append(complex.get(RESOUCE_RDF_STRING))
-
-            if self.hypergraph:
-                protein_dict[proteinID] = (disName, aliases, comment, cellularLocation, complexes)
-            else:
-                protein_dict[proteinID] = (disName, aliases, comment, self.cellularLocations.get(cellularLocation), complexes)
+ 
+            protein_dict[proteinID] = {
+                "name": disName, 
+                "aliases": aliases, 
+                "reactome_db_id" : comment, 
+                "cellularLocation": self.cellularLocations.get(cellularLocation) if self.hypergraph else cellularLocation,
+                "complexes": complexes
+            }
             
         return protein_dict
 
@@ -112,11 +107,9 @@ class ReactomeBioPAX():
         for physEntity in self.tree.findall("biopax:PhysicalEntity", namespaces):
             ID = physEntity.get("{%s}ID" % namespaces['rdf'])
             disName = physEntity.find("biopax:displayName", namespaces).text
-            cellularLocation = complex.find("biopax:cellularLocation", namespaces).get(RESOUCE_RDF_STRING).strip("#")
-            xref = [xre.get(RESOUCE_RDF_STRING).strip("#") for xre in complex.findall("biopax:xref", namespaces)]
+            cellularLocation = physEntity.find("biopax:cellularLocation", namespaces).get(RESOUCE_RDF_STRING).strip("#")
+            xref = [xre.get(RESOUCE_RDF_STRING).strip("#") for xre in physEntity.findall("biopax:xref", namespaces)]
             self.physical_entity[ID] = (disName, cellularLocation, xref)
-        
-
 
     def __parse_stoichometry(self):
         for stoichometry in self.tree.findall("biopax:Stoichiometry", namespaces):
@@ -207,17 +200,17 @@ class ReactomeBioPAX():
                             G.add_edge(l, rr, is_a = "reaction")
                     else:
                         G.add_edge(l, r, is_a = "reaction")
-        
         for node in G.nodes:
             if "Protein" in node:
-                G.nodes[node].update({
-                    "aliases" : self.proteins[node][1],
-                    "reactome_id" : self.proteins[node][2],
-                    "cellular_location" : self.proteins[node][3],
-                    "complex_membership" : self.proteins[node][4],
-                })
-        protein_map = dict((k,self.proteins[k][0]) for k,v in self.proteins.items())
-        molecules_map = dict((k,self.proteins[k][0]) for k,v in self.molecules.items())
-        physical_entity_map = dict((k,self.proteins[k][0]) for k,v in self.physical_entity.items())
-        G = nx.relabel_nodes(G, protein_map)
+                G.nodes[node].update(self.proteins[node])
+            elif "SmallMolecule" in node:
+                G.nodes[node].update(self.molecules[node])
+        
+
+        protein_map = dict((k,self.proteins[k]["name"]) for k,v in self.proteins.items())
+        molecules_map = dict((k,self.molecules[k]["name"]) for k,v in self.molecules.items())
+        physical_entity_map = dict((k,self.physical_entity[k][0]) for k,v in self.physical_entity.items())
+
+        G = nx.relabel_nodes(G, {**protein_map, **molecules_map, **physical_entity_map})
+
         return G

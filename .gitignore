@@ -1,0 +1,7 @@
+data/
+.vscode
+.ipynb_checkpoints
+gen_data/
+*__pycache__/
+*reactome_parser.egg*
+lib/
