@@ -5,3 +5,7 @@ gen_data/
 *__pycache__/
 *reactome_parser.egg*
 lib/
+
+*.ipynb
+*.txt
+*.sh
