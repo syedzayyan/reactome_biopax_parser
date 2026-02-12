@@ -1,5 +1,8 @@
 import xml.etree.ElementTree as ET
 import networkx as nx
+import pandas as pd
+import typing
+import logging
 
 namespaces = {
     "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
@@ -14,8 +17,9 @@ RESOUCE_RDF_STRING = "{%s}resource" % namespaces["rdf"]
 
 
 class ReactomeBioPAX:
-    def __init__(self):
+    def __init__(self, uniprot_accession_num = False):
         self.tree = None
+        self.uniprot_accession_num = uniprot_accession_num
 
     def parse_biopax3_file(self, filename: str):
         r"""Parse a BioPAX Level 3 XML file and populate internal data structures.
@@ -30,6 +34,8 @@ class ReactomeBioPAX:
 
         self.__parse_molecules()
         self.__parse_proteins()
+        # self.__parse_entity_references()
+        self.__parse_catalysis()
         self.__parse_protein_complexes()
 
         self.__parse_reactions()
@@ -73,7 +79,7 @@ class ReactomeBioPAX:
                 .get(RESOUCE_RDF_STRING, None)
                 .strip("#")
             ]
-            self.cellularLocations[locations.get(ID_RDF_STRING, None)] = (term, xref)
+            self.cellularLocations[locations.get(ID_RDF_STRING, None)] = {"common_name": term, **xref}
 
     def __parse_proteins(self):
         r"""Parse protein entities from the BioPAX file.
@@ -81,11 +87,21 @@ class ReactomeBioPAX:
         Extracts names, aliases, cellular locations, complex membership,
         and Reactome DB IDs for each protein.
         """
+        if self.uniprot_accession_num:
+            df_uni_reactome = pd.read_csv(
+                "/Users/bty644/Desktop/phd/code/collate_data/reactome/data/UniProt2Reactome_PE_All_Levels.txt",
+                sep="\t",
+                header=None,  # no header row in file
+                names=["source_db", "stable_id", "entity_name", "pathway_id", "url", "event_name", "evidence_code", "species"],
+            )
         self.proteins = {}
         for proteins in self.tree.findall("biopax:Protein", namespaces):
             proteinID = proteins.get(ID_RDF_STRING, None)
             complexity = proteins.findall("biopax:memberPhysicalEntity", namespaces)
             disName = proteins.find("biopax:displayName", namespaces).text
+            if disName is None:
+                disName = proteins.find("biopax:name", namespaces).text
+
             aliases = [nm.text for nm in proteins.findall("biopax:name", namespaces)]
             comment = proteins.find("biopax:comment", namespaces).text
             reactome_db_id = (
@@ -98,6 +114,20 @@ class ReactomeBioPAX:
                 .get(RESOUCE_RDF_STRING, None)
                 .strip("#")
             )
+            xref = [
+                self.uniXrefs.get(xre.get(RESOUCE_RDF_STRING, None).strip("#"), xre.get(RESOUCE_RDF_STRING, None).strip("#"))
+                for xre in proteins.findall("biopax:xref", namespaces)
+            ]
+
+            if self.uniprot_accession_num:
+                for ref in xref: 
+                    if ref["DB_NAME"] == "Reactome":
+                        try:
+                            db_id = ref["DB_ID"]
+                            uni_id = df_uni_reactome[df_uni_reactome['stable_id'] == db_id].iloc[0]['source_db']
+                        except Exception:
+                            uni_id = "not_available"
+
             complexes = []
             if len(complexity) > 0:
                 for complex in complexity:
@@ -110,8 +140,32 @@ class ReactomeBioPAX:
                 "comment": comment,
                 "cellularLocation": cellularLocation,
                 "complexes": complexes,
+                "xref": xref,
                 "color": "red",
             }
+            if self.uniprot_accession_num:
+                self.proteins[proteinID]["uniprot_id"] = uni_id
+
+    def __parse_catalysis(self):
+        self.catalysis_dets = {}
+
+        for catalysis in self.tree.findall("biopax:Catalysis", namespaces):
+            controlType = catalysis.find("biopax:controlType", namespaces).text.strip("#")
+            controller = catalysis.find("biopax:controller", namespaces).get(RESOUCE_RDF_STRING, None).strip("#")
+            controlled = catalysis.find("biopax:controlled", namespaces).get(RESOUCE_RDF_STRING, None).strip("#")
+
+            uniXref = [xref.get(RESOUCE_RDF_STRING, None) for xref in catalysis.findall("biopax:xref", namespaces)]
+            self.catalysis_dets[controlled] = {
+                "controlType" : controlType,
+                "controller" : controller,
+                "uniXref" : uniXref
+            }
+
+    def __parse_entity_references(self):
+        self.ProteinReference = {}
+        for entityReference in self.tree.findall("biopax:ProteinReference", namespaces):
+            entityReference = entityReference.find("biopax:displayName", namespaces).text
+        
 
     def __parse_protein_complexes(self):
         r"""Parse protein complex entities from the BioPAX file.
@@ -126,6 +180,8 @@ class ReactomeBioPAX:
         for complex in self.tree.findall("biopax:Complex", namespaces):
             complexId = complex.get(ID_RDF_STRING, None)
             disName = complex.find("biopax:displayName", namespaces).text
+            if disName is None:
+                disName = complex.find("biopax:name", namespaces).text
 
             component = [
                 cmop.get(RESOUCE_RDF_STRING, None).strip("#")
@@ -143,9 +199,8 @@ class ReactomeBioPAX:
                 .get(RESOUCE_RDF_STRING, None)
                 .strip("#")
             )
-            disName = complex.find("biopax:displayName", namespaces).text
             xref = [
-                xre.get(RESOUCE_RDF_STRING, None).strip("#")
+                self.uniXrefs.get(xre.get(RESOUCE_RDF_STRING, None).strip("#"), xre.get(RESOUCE_RDF_STRING, None).strip("#"))
                 for xre in complex.findall("biopax:xref", namespaces)
             ]
             dataSource = complex.find("biopax:dataSource", namespaces).text
@@ -164,9 +219,8 @@ class ReactomeBioPAX:
                 "xref": xref,
                 "componentStoichiometry": componentStoichiometry,
                 "dataSource": dataSource,
+                "complex_node" : True
             }
-
-        return self.complexes
 
     def __physical_entity(self):
         """Parse physical entities from the BioPAX file.
@@ -222,7 +276,10 @@ class ReactomeBioPAX:
             xrefID = ex_dblink.get(ID_RDF_STRING)
             db_id = ex_dblink.find("biopax:id", namespaces).text
             db_name = ex_dblink.find("biopax:db", namespaces).text
-            self.uniXrefs[xrefID] = (db_id, db_name)
+            self.uniXrefs[xrefID] = {
+                "DB_NAME" : db_name,
+                "DB_ID" : db_id
+            }
 
     def __parse_reactions(self):
         """Parse biochemical reactions and their directional relationships.
@@ -288,14 +345,19 @@ class ReactomeBioPAX:
         """
         proteins = []
         if entity in self.complexes:
-            _, components, _ = self.complexes[entity]
+            components = self.complexes[entity]["components"]
             for component_id in components:
                 proteins.extend(self.__flatten_complex_into_protein(component_id))
         else:
             return [entity]
         return proteins
 
-    def parse_biopax_into_networkx(self, filename: str):
+    def parse_biopax_into_networkx(
+        self, 
+        filename: str, 
+        complex_proteins_as_node: bool = False,
+        logger: typing.Optional[logging.Logger] = None
+    ):
         """Parse a BioPAX Level 3 file into a directed NetworkX graph.
 
         Constructs a directed reaction network where nodes represent molecular
@@ -303,57 +365,93 @@ class ReactomeBioPAX:
 
         Args:
             filename (str): Path to the BioPAX Level 3 file.
+            complex_proteins_as_node (bool): If True, expand complex proteins as separate nodes.
+            logger (logging.Logger, optional): Logger instance for debug/info messages. 
+                If None, no logging occurs.
 
         Returns:
             networkx.DiGraph: A directed graph representing biochemical interactions.
         """
+        if logger is not None:
+            logger.info(f"Parsing BioPAX file: {filename}")
+        
         self.parse_biopax3_file(filename)
         G = nx.DiGraph()
         step = 0
+        reaction_count = 0
+        
         for _, step_dets in self.reactionOrder.items():
             if step_dets[0][0] is not None:
                 step += 1
                 reactions = self.reactions[step_dets[0][0]]
+                catalysis_exists = self.catalysis_dets.get(step_dets[0][0], None)
+                
+                if catalysis_exists is not None:
+                    G.add_node(catalysis_exists["controller"], time=step)
+                    if logger is not None:
+                        logger.debug(f"Step {step}: Added catalyst node '{catalysis_exists['controller']}'")
+                
                 for left in reactions[0]:
+                    G.add_node(left, time=step)
+
+                    if "Complex" in left:
+                        protein_in_complexes = {}
+                        for component in self.__flatten_complex_into_protein(left):
+                            if complex_proteins_as_node:
+                                G.add_node(component, complex_component=True, color="violet")
+                                G.add_edge(component, left, is_a="complex_component", time=step)
+                            else:
+                                if "Protein" in component:
+                                    protein_in_complexes[component] = self.proteins[component]  
+
+                        G.nodes[left].update({"constituents": protein_in_complexes})  
+                        G.nodes[left].update({"type": "Complex", **self.complexes[left]})
+                    
+                    if catalysis_exists is not None:
+                        G.add_edge(catalysis_exists["controller"], left, time=step, is_a="catalysis", catalysis_type = catalysis_exists["controlType"])
+                    
                     for right in reactions[1]:
+                        G.add_node(right, time=step)
                         G.add_edge(left, right, time=step, is_a="reaction")
+                        reaction_count += 1
 
-        top_level_complexes = [node for node in G.nodes if "Complex" in node]
+                        if "Complex" in right:
+                            protein_in_complexes = {}
+                            for component in self.__flatten_complex_into_protein(right):
+                                if complex_proteins_as_node:
+                                    G.add_node(component, complex_component=True, color="violet")
+                                    G.add_edge(component, right, is_a="complex_component", time=step)
+                                else:
+                                    if "Protein" in component:
+                                        protein_in_complexes[component] = self.proteins[component]  
 
-        for node in top_level_complexes:
-            for component in self.__flatten_complex_into_protein(node):
-                if "Protein" in component:
-                    G.add_node(component, complex_component=True, color="violet")
-                    G.add_edge(component, node, complex_relationship=True)
+                            G.nodes[right].update({"constituents": protein_in_complexes})  
+                            G.nodes[right].update({"type": "Complex", **self.complexes[right]})
 
+        if logger is not None:
+            logger.info(f"Built graph with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges over {step} steps ({reaction_count} reactions)")
+
+        # Node type annotations
         for node in G.nodes:
             if "Protein" in node:
-                G.nodes[node].update(self.proteins[node])
+                G.nodes[node].update({"type": "protein", **self.proteins[node]})
             elif "SmallMolecule" in node:
-                G.nodes[node].update(self.molecules[node])
+                G.nodes[node].update({"type": "small_molecule", **self.molecules[node]})
             elif "PhysicalEntity" in node:
-                G.nodes[node].update(self.physical_entity[node])
-            else:
-                pass
+                G.nodes[node].update({"type": "physical_entity", **self.physical_entity[node]})
 
-        protein_map = dict(
-            (k, self.proteins[k]["name"]) for k, v in self.proteins.items()
-        )
-        molecules_map = dict(
-            (k, self.molecules[k]["name"]) for k, v in self.molecules.items()
-        )
-        physical_entity_map = dict(
-            (k, self.physical_entity[k]["name"])
-            for k, v in self.physical_entity.items()
-        )
-        complexes_map = dict(
-            (k, self.complexes[k][0]) for k, v in self.complexes.items()
-        )
+        # Relabeling mappings
+        protein_map = dict((k, self.proteins[k]["name"]) for k, v in self.proteins.items())
+        molecules_map = dict((k, self.molecules[k]["name"]) for k, v in self.molecules.items())
+        physical_entity_map = dict((k, self.physical_entity[k]["name"]) for k, v in self.physical_entity.items())
+        complexes_map = dict((k, self.complexes[k]["name"]) for k, v in self.complexes.items())
 
-        G = nx.relabel_nodes(
-            G, {**protein_map, **molecules_map, **physical_entity_map, **complexes_map}
-        )
+        G = nx.relabel_nodes(G, {**protein_map, **molecules_map, **physical_entity_map, **complexes_map})
         G.remove_edges_from(nx.selfloop_edges(G))
+        
+        if logger is not None:
+            logger.info("Graph relabeling complete. Self-loops removed.")
+        
         return G
 
     def parse_biopax_into_ubergraphs(self, filename: str):
