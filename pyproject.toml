@@ -1,0 +1,22 @@
+[project]
+name = "reactome-graphs"
+version = "0.1.0"
+description = "Reactome graph utilities"
+authors = [{ name = "Zayyan" }]
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "networkx",
+    "requests",
+    "pandas",
+    "tqdm"
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["reactome_graphs*"]

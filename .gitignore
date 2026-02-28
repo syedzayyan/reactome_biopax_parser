@@ -3,9 +3,18 @@ data/
 .ipynb_checkpoints
 gen_data/
 *__pycache__/
+__marimo__
 *reactome_parser.egg*
+reactome_graphs.egg-info/
 lib/
 
 *.ipynb
 *.txt
 *.sh
+
+tpnet/
+STHN/
+
+.venv/
+
+tgat/

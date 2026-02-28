@@ -1,8 +1,10 @@
 import time
-import requests
-import pandas as pd
-from tqdm.auto import tqdm 
 from typing import List
+
+import pandas as pd
+import requests
+from tqdm.auto import tqdm
+
 
 def download_list_of_pathways(save_dir: str = "./"):
     """Download the master list of Reactome pathways.
@@ -13,12 +15,13 @@ def download_list_of_pathways(save_dir: str = "./"):
     Args:
         save_dir (str, optional): Directory path to save the file. Defaults to "./".
     """
-    res = requests.get('https://reactome.org/download/current/ReactomePathways.txt')
+    res = requests.get("https://reactome.org/download/current/ReactomePathways.txt")
     if res.ok:
         with open(f"{save_dir}list_of_pathways.txt", mode="wb") as file:
             file.write(res.content)
     else:
         ValueError(res)
+
 
 def download_single_biopax_file_by_pathway_id(id: str, save_dir: str = "./"):
     """Download a single BioPAX Level 3 file by Reactome pathway ID.
@@ -33,12 +36,15 @@ def download_single_biopax_file_by_pathway_id(id: str, save_dir: str = "./"):
     url = f"https://reactome.org/ReactomeRESTfulAPI/RESTfulWS/biopaxExporter/Level3/{id.strip('R-HSA-')}"
     res = requests.get(url, stream=True)
     if res.ok:
-        with open(f'{save_dir}{id}.xml', 'wb') as out_file:
+        with open(f"{save_dir}{id}.xml", "wb") as out_file:
             out_file.write(res.content)
     else:
         ValueError(res)
 
-def download_biopax_files_by_org(save_dir: str = "./", species: str = "Homo sapiens", sleep_timer: int = 30):
+
+def download_biopax_files_by_org(
+    save_dir: str = "./", species: str = "Homo sapiens", sleep_timer: int = 30
+):
     """Download BioPAX Level 3 files for all pathways of a given organism.
 
     Reads the list of Reactome pathways, filters by species name, and downloads
@@ -50,7 +56,9 @@ def download_biopax_files_by_org(save_dir: str = "./", species: str = "Homo sapi
         species (str, optional): Species name to filter pathways (e.g., "Homo sapiens"). Defaults to "Homo sapiens".
         sleep_timer (int, optional): Delay (in seconds) before retrying a failed download. Defaults to 30.
     """
-    list_of_pathways = pd.read_csv("./data/list_of_pathways.txt", delimiter="\t", names = ["id", "name", "species"])
+    list_of_pathways = pd.read_csv(
+        "./data/list_of_pathways.txt", delimiter="\t", names=["id", "name", "species"]
+    )
     list_of_pathways = list_of_pathways[list_of_pathways.species == species]
     for ids in tqdm(list_of_pathways.id):
         try:
@@ -60,35 +68,26 @@ def download_biopax_files_by_org(save_dir: str = "./", species: str = "Homo sapi
             time.sleep(sleep_timer)
             download_single_biopax_file_by_pathway_id(ids, save_dir)
 
+
 def query_entities_to_json(save_dir: str = "./", reactome_id: str = "R-HSA-198171"):
     request_url = f"https://reactome.org/ContentService/data/query/{reactome_id}"
     res = requests.get(request_url, stream=True)
     if res.ok:
-        with open(f'{save_dir}{reactome_id}.json', 'wb') as out_file:
+        with open(f"{save_dir}{reactome_id}.json", "wb") as out_file:
             out_file.write(res.content)
     else:
         ValueError(res)
 
-def download_uniprot_mapping_files(reactome_db_version: str = "94", level: str = "lowest", save_dir: str = "./"):    
-    if level == "lowest":
-        db_resouce_file = "UniProt2Reactome_All_Levels"
-    elif level == "phys_ent": 
-        db_resouce_file = "UniProt2Reactome_PE_All_Levels"
-    else:
-        raise NotImplementedError
-    request_url = f"https://download.reactome.org/{reactome_db_version}/{db_resouce_file}.txt"
-    res = requests.get(request_url, stream=True)
-    if res.ok:
-        with open(f'{save_dir}/{db_resouce_file}.txt', 'wb') as out_file:
-            out_file.write(res.content)
 
 def download_uniprot_json_from_accession_id(uniprot_ids: List[str]):
     for ids in tqdm(uniprot_ids):
-        res = requests.get(f"https://www.ebi.ac.uk/proteins/api/proteins/{ids}", stream=True)
+        res = requests.get(
+            f"https://www.ebi.ac.uk/proteins/api/proteins/{ids}", stream=True
+        )
         request_success = False
         while not request_success:
             if res.ok:
-                with open(f'./data/protein_json/{ids}.json', 'wb') as out_file:
+                with open(f"./data/protein_json/{ids}.json", "wb") as out_file:
                     out_file.write(res.content)
                     request_success = True
             else:
