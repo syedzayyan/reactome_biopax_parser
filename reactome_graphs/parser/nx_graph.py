@@ -1,5 +1,6 @@
 import logging
 import typing
+from collections import deque
 
 import networkx as nx
 
@@ -71,13 +72,22 @@ class _NxGraphMixin:
                 # Translocation reactions are already 1-to-1 paired — no expansion needed
                 # In parse_biopax_into_networkx, translocation branch:
                 if reaction_type == "translocation":
+                    # Expand catalyst for translocation too
+                    expanded_catalysts_trans = []
+                    if catalysis_exists is not None:
+                        catalyst_id = catalysis_exists["controller"]
+                        expanded_catalysts_trans = self._expand_single_entity(
+                            catalyst_id
+                        )
+                    else:
+                        expanded_catalysts_trans = [None]
+
                     for left, right in zip(left_entities, right_entities):
                         if (
                             left in self.physical_entity
                             or right in self.physical_entity
                         ):
                             continue
-                        # Expand members but zip (not product) — they're already name-matched 1-to-1
                         left_expansions = self._expand_single_entity(left)
                         right_expansions = self._expand_single_entity(right)
                         for l, r in zip(left_expansions, right_expansions):
@@ -93,6 +103,20 @@ class _NxGraphMixin:
                                     type="translocation",
                                     pathway=pathway_name,
                                 )
+                                # Wire catalyst → left node
+                                for cat in expanded_catalysts_trans:
+                                    if cat is not None:
+                                        G.add_node(cat)
+                                        G.add_edge(
+                                            cat,
+                                            l,
+                                            time=step,
+                                            type="catalysis",
+                                            catalysis_type=catalysis_exists[
+                                                "controlType"
+                                            ],
+                                            pathway=pathway_name,
+                                        )
                     continue
 
                 # Normal path — member expansion + cartesian product
@@ -492,6 +516,7 @@ class _NxGraphMixin:
                         if cmp_data:
                             G.add_node(label)
                             G.nodes[label].update({"type": cmp_type, **cmp_data})
+                            G.add_edge(label, node, type="complex_component", time=0)
                             added += 1
         or_survivors = [n for n in G.nodes if str(n).startswith("[OR]")]
         G.remove_nodes_from(or_survivors)
@@ -542,6 +567,7 @@ class _NxGraphMixin:
             self.dna,
             self.rna,
             self.physical_entity,
+            self.complexes,  # ← ADD THIS
         ):
             if entity_id in store:
                 return self._make_label(store[entity_id]["name"], store[entity_id])

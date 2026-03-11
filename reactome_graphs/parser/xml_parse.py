@@ -625,18 +625,24 @@ class _ParserBase:
                 paired_right.append(right_by_name[name])
 
         return paired_left, paired_right
-
     def _is_translocation(self, lefties: list, righties: list) -> bool:
-        """Detect translocation by structure: same entity name, different cellular location."""
+        """True only if the MAJORITY of paired entities are same-name, different-location."""
         all_stores = (self.proteins, self.molecules, self.dna, self.rna)
+
+        matched_pairs = 0
+        translocation_pairs = 0
+
         for l in lefties:
             for r in righties:
                 for store in all_stores:
                     if l in store and r in store:
-                        if (
-                            store[l]["name"] == store[r]["name"]
-                            and store[l]["cellularLocation"]
-                            != store[r]["cellularLocation"]
-                        ):
-                            return True
-        return False
+                        if store[l]["name"] == store[r]["name"]:
+                            matched_pairs += 1
+                            if store[l]["cellularLocation"] != store[r]["cellularLocation"]:
+                                translocation_pairs += 1
+
+        if matched_pairs == 0:
+            return False
+
+        # Require >50% of name-matched pairs to differ in location
+        return (translocation_pairs / matched_pairs) > 0.5 and translocation_pairs == len(lefties)

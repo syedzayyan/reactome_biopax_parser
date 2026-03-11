@@ -8,18 +8,78 @@ import networkx as nx
 import requests
 
 
+DEFAULT_EDGE_TYPES: list[str] | None = None
+
+
 class NodeFeaturiser:
     def __init__(
-        self, G: nx.DiGraph, xref_dict: dict, cache_dir: str = ".cache/node_featuriser"
+        self,
+        G: nx.DiGraph,
+        xref_dict: dict,
+        cache_dir: str = ".cache/node_featuriser",
+        fingerprinter="morgan",
+        embed_dim: int = 128,
+        protein_model_name: str = "facebook/esm2_t6_8M_UR50D",
+        protein_model_path=None,
+        protein_model_device: str = "cpu",
+        edge_types: list[str] | None = None,
+        node_types: list[str] | None = None,
+        parser = None
     ):
         self.G = G
         self.xref_dict = xref_dict
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.fingerprinter = fingerprinter
+        self.embed_dim = embed_dim
+        self.protein_model_name = protein_model_name
+        self.protein_model_path = protein_model_path
+        self.protein_model_device = protein_model_device
+
+        self.edge_types = edge_types or DEFAULT_EDGE_TYPES
+        self.node_types = node_types
+
+        self.parser = parser
 
     # ------------------------------------------------------------------ #
     #  CACHE HELPERS                                                       #
     # ------------------------------------------------------------------ #
+
+    def _build_node_type_vocab(self) -> tuple[list[str], dict[str, int]]:
+        """
+        Infer node type vocabulary from G.nodes[n]['type'], or use self.node_types
+        if pinned. Always appends <unk> as the final slot.
+        """
+        UNK = "<unk>"
+
+        if self.node_types is not None:
+            vocab = list(self.node_types)
+        else:
+            seen: dict[str, None] = {}
+            for n in self.G.nodes:
+                t = self.G.nodes[n].get("type", "")
+                if t:
+                    seen[t] = None
+            vocab = list(seen.keys())
+
+        if UNK not in vocab:
+            vocab = vocab + [UNK]
+
+        return vocab, {t: i for i, t in enumerate(vocab)}
+
+    def _build_edge_type_vocab(self, edges):
+        # Build vocab WITHOUT <unk> — it should never appear as a real label
+        seen: dict[str, None] = {}
+        for _, _, data in edges:
+            t = data.get("type", "")
+            if t and t != "<unk>":  # ← explicitly exclude
+                seen[t] = None
+        vocab = (
+            list(self.edge_types) if self.edge_types is not None else list(seen.keys())
+        )
+        vocab = [v for v in vocab if v != "<unk>"]  # strip if caller passed it in
+        self.edge_types = vocab
+        return vocab, {t: i for i, t in enumerate(vocab)}
 
     def _cache_path(self, db: str) -> Path:
         safe_name = re.sub(r"[^\w]", "_", db).lower()
@@ -93,7 +153,6 @@ class NodeFeaturiser:
             if not db or not db_id:
                 continue
 
-            # Prefer stable Reactome ID (R-HSA-...) over release-specific DB ID
             if db == "Reactome":
                 return f"Reactome:{db_id}"
             elif db.startswith("Reactome Database ID"):
@@ -195,9 +254,7 @@ class NodeFeaturiser:
                 r = requests.get(url, timeout=30)
                 r.raise_for_status()
                 for compound in r.json().get("PC_Compounds", []):
-                    # Extract CID
                     cid = str(compound.get("id", {}).get("id", {}).get("cid", ""))
-                    # Find canonical SMILES from props
                     smiles = next(
                         (
                             p["value"]["sval"]
@@ -226,7 +283,6 @@ class NodeFeaturiser:
             return cached
 
         results = {}
-        # Ensembl batch limit is 50
         for chunk in self._chunks(missing, 50):
             try:
                 r = requests.post(
@@ -258,7 +314,6 @@ class NodeFeaturiser:
             return cached
 
         results = {}
-        # NCBI efetch accepts comma-separated IDs
         for chunk in self._chunks(missing, 20):
             try:
                 r = requests.get(
@@ -272,13 +327,12 @@ class NodeFeaturiser:
                     timeout=30,
                 )
                 r.raise_for_status()
-                # Multi-FASTA — split on ">"
                 current_id, seq_lines = None, []
                 for line in r.text.splitlines():
                     if line.startswith(">"):
                         if current_id:
                             results[current_id] = "".join(seq_lines)
-                        current_id = line[1:].split()[0]  # first token after ">"
+                        current_id = line[1:].split()[0]
                         seq_lines = []
                     else:
                         seq_lines.append(line.strip())
@@ -308,7 +362,6 @@ class NodeFeaturiser:
                 r.raise_for_status()
                 data = r.json()
                 entry = data[0] if isinstance(data, list) else data
-                # Ligands have SMILES directly
                 smiles = entry.get("smiles") or entry.get("structuralData", {}).get(
                     "smiles"
                 )
@@ -338,13 +391,9 @@ class NodeFeaturiser:
             "PubChem Substance": (self.fetch_pubchem, "smiles"),
             "ENSEMBL": (self.fetch_ensembl, "sequence"),
             "NCBI Nucleotide": (self.fetch_ncbi_nucleotide, "sequence"),
-            "Guide to Pharmacology": (
-                self.fetch_guide_to_pharmacology,
-                "smiles",
-            ),  # <- was "sequence"
+            "Guide to Pharmacology": (self.fetch_guide_to_pharmacology, "smiles"),
         }
 
-        # Download per database
         db_results = {}
         for db, (fetcher, _) in fetchers.items():
             if db not in id_map:
@@ -353,7 +402,6 @@ class NodeFeaturiser:
             print(f"[{db}] {len(unique_ids)} unique IDs...")
             db_results[db] = fetcher(unique_ids)
 
-        # Write back to graph nodes
         for node in self.G.nodes:
             data = self.G.nodes[node]
 
@@ -392,10 +440,16 @@ class NodeFeaturiser:
     #  5. FEATURISATION                                                    #
     # ------------------------------------------------------------------ #
 
-    def featurise(self, embed_dim: int = 512) -> None:
+    def featurise(
+        self,
+        add_go_embedding: bool = False,
+        go_embedding_path: str = "embeddings.pt",
+    ) -> None:
         """
-        Converts raw sequence/SMILES node attributes to fixed-dim feature vectors.
-        Stores result in G.nodes[node]["feature"] (np.ndarray of shape [embed_dim]).
+        Converts raw sequence/SMILES node attributes to natural-dim feature vectors.
+        Each modality outputs its native dimensionality (ESM-2: model hidden size,
+        Morgan: 2048, k-mer: 4^k). Features are stored in G.nodes[node]["feature"].
+
         Requires (optional, imported lazily):
             - rdkit: for Morgan fingerprints (SMILES)
             - torch + transformers: for ESM-2 protein embeddings
@@ -422,15 +476,14 @@ class NodeFeaturiser:
         )
 
         # -- Load feature cache ------------------------------------------------
-        feat_cache_path = self.cache_dir / f"features_dim{embed_dim}.npz"
+        feat_cache_path = self.cache_dir / "features.npz"
         feat_cache = {}
         if feat_cache_path.exists():
             loaded = np.load(feat_cache_path, allow_pickle=False)
             feat_cache = {k: loaded[k] for k in loaded.files}
             print(f"[Featurise] {len(feat_cache)} features loaded from cache")
 
-        def _apply_cached(node_dict: dict) -> dict:
-            """Split node_dict into {node: feat} hits and {node: data} misses."""
+        def _apply_cached(node_dict: dict) -> tuple[dict, dict]:
             hits, misses = {}, {}
             for node, val in node_dict.items():
                 if node in feat_cache:
@@ -445,7 +498,7 @@ class NodeFeaturiser:
             for node, feat in cached_hits.items():
                 G.nodes[node]["feature"] = feat
             if uncached:
-                esm_feats = self._embed_esm(uncached, embed_dim)
+                esm_feats = self._embed_esm(uncached)
                 for node, feat in esm_feats.items():
                     G.nodes[node]["feature"] = feat
                     feat_cache[node] = feat
@@ -456,7 +509,7 @@ class NodeFeaturiser:
             for node, feat in cached_hits.items():
                 G.nodes[node]["feature"] = feat
             if uncached:
-                morgan_feats = self._embed_morgan(uncached, embed_dim)
+                morgan_feats = self._embed_morgan(uncached)
                 for node, feat in morgan_feats.items():
                     G.nodes[node]["feature"] = feat
                     feat_cache[node] = feat
@@ -467,11 +520,13 @@ class NodeFeaturiser:
             for node, feat in cached_hits.items():
                 G.nodes[node]["feature"] = feat
             if uncached:
-                kmer_feats = self._embed_kmer(uncached, embed_dim)
+                kmer_feats = self._embed_kmer(uncached)
                 for node, feat in kmer_feats.items():
                     G.nodes[node]["feature"] = feat
                     feat_cache[node] = feat
 
+
+        
         # -- Save updated cache ------------------------------------------------
         if feat_cache:
             np.savez(feat_cache_path, **feat_cache)
@@ -479,19 +534,108 @@ class NodeFeaturiser:
                 f"[Featurise] Cache saved ({len(feat_cache)} entries) → {feat_cache_path}"
             )
 
-        # -- Complexes: mean pool members --------------------------------------
-        self._featurise_complexes(G, embed_dim)
-
-        # -- Remaining unfeaturised: zero vector -------------------------------
+        # -- Remaining unfeaturised: zero vector (dim inferred from peers) -----
+        feat_dim = next(
+            (
+                G.nodes[n]["feature"].shape[0]
+                for n in G.nodes
+                if G.nodes[n].get("feature") is not None
+            ),
+            self.embed_dim,
+        )
         zero_count = 0
         for node in G.nodes:
             if G.nodes[node].get("feature") is None:
-                G.nodes[node]["feature"] = np.zeros(embed_dim)
+                G.nodes[node]["feature"] = np.zeros(feat_dim, dtype=np.float32)
                 zero_count += 1
         if zero_count:
             print(
                 f"[Featurise] {zero_count} nodes have zero vectors (no data available)"
             )
+
+        # -- Complexes: mean pool members --------------------------------------
+        self._featurise_complexes(G)
+        
+        if add_go_embedding:
+            self._append_go_embeddings(G, go_embedding_path)
+
+    def _append_go_embeddings(self, G, path: str) -> None:
+        """
+        Load GO Node2Vec embeddings and concatenate onto existing node features.
+        Sources GO terms from:
+          1. G.nodes[node]["go_terms"]  — protein-level annotations (list of GO IDs)
+          2. G.nodes[node]["cellularLocation"]["DB_ID"]  — compartment from BioPAX parse
+
+        For nodes with no matching GO terms, a zero vector is appended to keep
+        feature dimensionality consistent across all nodes.
+
+        Expects embeddings.pt saved as either:
+          - {go_id: tensor}  (per-term dict)
+          - {"embedding_matrix": tensor, "node_to_idx": dict, "idx_to_node": dict}
+        """
+        import numpy as np
+        import torch
+        from pathlib import Path
+
+        if not Path(path).exists():
+            print(f"[GO] Embedding file not found: {path} — skipping")
+            return
+
+        raw = torch.load(path, map_location="cpu")
+
+        if isinstance(raw, dict) and "embedding_matrix" in raw:
+            node_to_idx = raw["node_to_idx"]
+            matrix = raw["embedding_matrix"]
+            go_embeddings = {
+                go_id: matrix[idx].detach().numpy().astype(np.float32)
+                for go_id, idx in node_to_idx.items()
+            }
+        else:
+            go_embeddings = {
+                go_id: vec.detach().numpy().astype(np.float32)
+                for go_id, vec in raw.items()
+            }
+
+        if not go_embeddings:
+            print("[GO] No embeddings loaded — skipping")
+            return
+
+        go_dim = next(iter(go_embeddings.values())).shape[0]
+        zero_go = np.zeros(go_dim, dtype=np.float32)
+
+        enriched, missing = 0, 0
+
+        for node in G.nodes:
+            existing = G.nodes[node].get("feature")
+            if existing is None:
+                continue
+
+            # Collect GO IDs from both sources
+            go_terms = list(G.nodes[node].get("go_terms", []))
+
+            cell_loc = G.nodes[node].get("cellularLocation")
+            if cell_loc and isinstance(cell_loc, dict):
+                db_id = cell_loc.get("DB_ID", "")
+                if db_id.startswith("GO:"):
+                    go_terms.append(db_id)
+
+            # Mean pool over all terms that exist in the embedding vocab
+            term_vecs = [go_embeddings[t] for t in go_terms if t in go_embeddings]
+
+            if term_vecs:
+                go_vec = np.mean(term_vecs, axis=0).astype(np.float32)
+                enriched += 1
+            else:
+                go_vec = zero_go
+                missing += 1
+
+            G.nodes[node]["feature"] = np.concatenate([existing, go_vec])
+
+        print(
+            f"[GO] Appended {go_dim}-dim GO embeddings: "
+            f"{enriched} nodes enriched, {missing} nodes got zero vector"
+        )
+
 
     def _infer_sequence_type(self, sequence: str) -> str:
         """Heuristic: if >80% ACGTU characters, treat as DNA/RNA."""
@@ -500,8 +644,8 @@ class NodeFeaturiser:
         ratio = sum(c in nucleotide_chars for c in seq) / max(len(seq), 1)
         return "dna" if ratio > 0.8 else "protein"
 
-    def _embed_esm(self, protein_seqs: dict, embed_dim: int) -> dict:
-        """ESM-2 embeddings for protein sequences via HuggingFace transformers."""
+    def _embed_esm(self, protein_seqs: dict) -> dict:
+        """ESM-2 mean-pooled embeddings. Output dim = model hidden size."""
         import numpy as np
 
         try:
@@ -511,14 +655,14 @@ class NodeFeaturiser:
             print(
                 "[ESM] transformers not installed. pip install transformers. Falling back to one-hot."
             )
-            return self._embed_onehot_protein(protein_seqs, embed_dim)
+            return self._embed_onehot_protein(protein_seqs)
 
-        model_name = "facebook/esm2_t33_650M_UR50D"
+        model_name = self.protein_model_path or self.protein_model_name
         print(f"[ESM] Loading ESM-2 model ({model_name})...")
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         model = EsmModel.from_pretrained(model_name)
         model.eval()
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = self.protein_model_device
         model = model.to(device)
 
         results = {}
@@ -527,8 +671,6 @@ class NodeFeaturiser:
         for i in range(0, len(items), 32):
             batch = items[i : i + 32]
             nodes, seqs = zip(*batch)
-
-            # Truncate to 1022 + special tokens = 1024 max
             seqs_truncated = [s[:1022] for s in seqs]
 
             tokens = tokenizer(
@@ -543,21 +685,18 @@ class NodeFeaturiser:
             with torch.no_grad():
                 out = model(**tokens)
 
-            # last_hidden_state: [B, L, D] — exclude BOS/EOS tokens, mean pool
             hidden = out.last_hidden_state  # [B, L, D]
             attention_mask = tokens["attention_mask"]  # [B, L]
 
             for j, node in enumerate(nodes):
-                # Mask out padding and special tokens (first and last non-pad)
                 seq_len = attention_mask[j].sum().item()
                 feat = hidden[j, 1 : seq_len - 1, :]  # exclude BOS + EOS
-                feat = feat.mean(dim=0).cpu().numpy().astype(np.float32)
-                results[node] = self._resize(feat, embed_dim)
+                results[node] = feat.mean(dim=0).cpu().numpy().astype(np.float32)
 
         return results
 
-    def _embed_morgan(self, smiles_nodes: dict, embed_dim: int) -> dict:
-        """Morgan fingerprints (2048-bit) for SMILES, resized to embed_dim."""
+    def _embed_morgan(self, smiles_nodes: dict, nBits: int = 2048) -> dict:
+        """Morgan fingerprints. Output dim = nBits (default 2048)."""
         import numpy as np
 
         try:
@@ -565,15 +704,12 @@ class NodeFeaturiser:
             from rdkit.Chem import AllChem
         except ImportError:
             print("[RDKit] rdkit not installed. pip install rdkit. Using zero vectors.")
-            return {node: np.zeros(embed_dim) for node in smiles_nodes}
+            return {node: np.zeros(nBits, dtype=np.float32) for node in smiles_nodes}
 
         def _mol_from_smiles(smi: str):
-            """Try standard parse, fall back to sanitize=False + partial sanitization."""
             mol = Chem.MolFromSmiles(smi)
             if mol is not None:
                 return mol
-            # Retry without sanitization, then apply partial sanitization
-            # (skip SMILES valence check which rejects e.g. [N]=O systems)
             mol = Chem.MolFromSmiles(smi, sanitize=False)
             if mol is None:
                 return None
@@ -588,25 +724,24 @@ class NodeFeaturiser:
         results = {}
         for node, smi in smiles_nodes.items():
             if not smi:
-                results[node] = np.zeros(embed_dim)
+                results[node] = np.zeros(nBits, dtype=np.float32)
                 continue
             try:
                 mol = _mol_from_smiles(smi)
                 if mol is None:
                     raise ValueError(f"Could not parse SMILES: {smi}")
                 fp = AllChem.GetMorganFingerprintAsBitVect(
-                    mol, radius=2, nBits=2048, useChirality=True
+                    mol, radius=2, nBits=nBits, useChirality=True
                 )
-                feat = np.array(fp, dtype=np.float32)
-                results[node] = self._resize(feat, embed_dim)
+                results[node] = np.array(fp, dtype=np.float32)
             except Exception as e:
                 print(f"[Morgan] Failed {node}: {e}")
-                results[node] = np.zeros(embed_dim)
+                results[node] = np.zeros(nBits, dtype=np.float32)
 
         return results
 
-    def _embed_kmer(self, dna_nodes: dict, embed_dim: int, k: int = 4) -> dict:
-        """K-mer frequency vectors for DNA/RNA sequences."""
+    def _embed_kmer(self, dna_nodes: dict, k: int = 4) -> dict:
+        """K-mer frequency vectors. Output dim = 4^k (256 for k=4)."""
         from itertools import product
 
         import numpy as np
@@ -614,11 +749,11 @@ class NodeFeaturiser:
         alphabet = "ACGT"
         kmers = ["".join(p) for p in product(alphabet, repeat=k)]
         kmer_index = {km: i for i, km in enumerate(kmers)}
-        kmer_dim = len(kmers)  # 4^k = 256 for k=4
+        kmer_dim = len(kmers)
 
         results = {}
         for node, seq in dna_nodes.items():
-            seq = seq.upper().replace("U", "T")  # RNA -> DNA
+            seq = seq.upper().replace("U", "T")
             vec = np.zeros(kmer_dim, dtype=np.float32)
             total = 0
             for i in range(len(seq) - k + 1):
@@ -627,13 +762,13 @@ class NodeFeaturiser:
                     vec[kmer_index[km]] += 1
                     total += 1
             if total > 0:
-                vec /= total  # normalise to frequencies
-            results[node] = self._resize(vec, embed_dim)
+                vec /= total
+            results[node] = vec
 
         return results
 
-    def _embed_onehot_protein(self, protein_seqs: dict, embed_dim: int) -> dict:
-        """Fallback: mean one-hot encoding over amino acid alphabet."""
+    def _embed_onehot_protein(self, protein_seqs: dict) -> dict:
+        """Fallback: mean one-hot over amino acid alphabet. Output dim = 20."""
         import numpy as np
 
         AA = "ACDEFGHIKLMNPQRSTVWY"
@@ -646,38 +781,89 @@ class NodeFeaturiser:
                     vec[aa_index[aa]] += 1
             if len(seq) > 0:
                 vec /= len(seq)
-            results[node] = self._resize(vec, embed_dim)
+            results[node] = vec
         return results
 
-    def _featurise_complexes(self, G, embed_dim: int) -> None:
-        """Mean pool member features for complex nodes, iteratively for nesting."""
+    def _featurise_complexes(self, G):
         import numpy as np
+        
+        # Get global featdim from existing leaves
+        leaf_feats = [G.nodes[n]['feature'] for n in G.nodes 
+                      if G.nodes[n].get('feature') is not None and 
+                         G.nodes[n].get('type') not in ('complex', 'Complex')]
+        if not leaf_feats:
+            print("No leaf features found - skipping complexes")
+            return
+        featdim = leaf_feats[0].shape[0]
+        
+        # idtonode map (same as before)
+        idtonode = {}
+        for store_name in ['proteins', 'molecules', 'dna', 'rna', 'physical_entity', 'complexes']:
+            store = getattr(self.parser, store_name, {})
+            for entity_id, data in store.items():
+                label = self.parser._make_label_for_id(entity_id)
+                if label:
+                    idtonode[entity_id] = label
+        for node in G.nodes:
+            data = G.nodes[node]
+            for attr in ['reactomedbid', 'refid', 'uniprotid', 'entityRef']:
+                val = data.get(attr)
+                if val:
+                    idtonode[str(val)] = node
+        
+        def flatten_and_pool(node):
+            """Flatten to leaves, resize, mean pool"""
+            # Find raw_id for this label
+            raw_id = None
+            for store in [getattr(self.parser, 'complexes', {})]:
+                for eid, data in store.items():
+                    if self.parser._make_label_for_id(eid) == node:
+                        raw_id = eid
+                        break
+                if raw_id: break
+            
+            if not raw_id:
+                G.nodes[node]['feature'] = np.zeros(featdim, dtype=np.float32)
+                return
+            
+            def get_leaf_feats(eid, visited=None):
+                if visited is None: visited = set()
+                if eid in visited: return []
+                visited.add(eid)
+                
+                label = idtonode.get(eid)
+                if not label or label not in G:
+                    return []
+                
+                data = G.nodes[label]
+                if data.get('type') not in ('complex', 'Complex'):
+                    feat = data.get('feature')
+                    if feat is not None and feat.shape == (featdim,):
+                        return [feat]
+                    return []
+                
+                # Recurse
+                feats = []
+                if eid in self.parser.complexes:
+                    for comp_id in self.parser.complexes[eid].get('components', []):
+                        feats.extend(get_leaf_feats(comp_id, visited))
+                return feats
+            
+            all_feats = get_leaf_feats(raw_id)
+            if all_feats:
+                result = np.mean(all_feats, axis=0).astype(np.float32)
+            else:
+                result = np.zeros(featdim, dtype=np.float32)
+            
+            G.nodes[node]['feature'] = result
+        
+        # Process all complexes
+        complexes = [n for n in G.nodes if G.nodes[n].get('type') in ('complex', 'Complex')]
+        for c in complexes:
+            flatten_and_pool(c)
+        
+        print(f"Featurised {len(complexes)} complexes")
 
-        complex_nodes = [n for n in G.nodes if G.nodes[n].get("type") == "complex"]
-
-        for _ in range(10):  # max iterations for nested complexes
-            progress = False
-            for node in complex_nodes:
-                if G.nodes[node].get("feature") is not None:
-                    continue
-                members = G.nodes[node].get("members", [])
-                member_feats = [
-                    G.nodes[m]["feature"]
-                    for m in members
-                    if m in G.nodes and G.nodes[m].get("feature") is not None
-                ]
-                if member_feats:
-                    G.nodes[node]["feature"] = np.mean(member_feats, axis=0)
-                    progress = True
-            if not progress:
-                break
-
-        resolved = sum(
-            1 for n in complex_nodes if G.nodes[n].get("feature") is not None
-        )
-        print(
-            f"[Complex] {resolved}/{len(complex_nodes)} featurised via member pooling"
-        )
 
     def _resize(self, vec, target_dim: int):
         """Resize vector to target_dim by truncating or zero-padding."""
@@ -690,25 +876,10 @@ class NodeFeaturiser:
         else:
             return np.pad(vec, (0, target_dim - len(vec)))
 
-    def to_dgbatch(self, mlp=None) -> "DGData":
-        """
-        Export the graph to a TGM DGData object for use with DGStorage/DGBatch.
-
-        Args:
-            mlp: Optional torch.nn.Module that projects raw node features to a
-                desired embedding dim. Called as mlp(static_node_x) -> Tensor.
-                e.g. nn.Sequential(nn.Linear(512, 128), nn.ReLU(), nn.Linear(128, 128))
-
-        Requires:
-            - featurise() to have been called (node features in G.nodes[n]["feature"])
-            - download_and_store() to have been called (edges present in G)
-
-        Returns:
-            DGData: A TGM-compatible dynamic graph data object.
-        """
+    def to_dgbatch(self, edge_types: list[str] | None = None) -> "DGData":
         import numpy as np
         import torch
-        from tgm import DGData
+        from tgm.data import DGData
 
         G = self.G
 
@@ -732,23 +903,13 @@ class NodeFeaturiser:
                 "[DGBatch] No node features found — call featurise() first."
             )
 
-        static_node_x = torch.tensor(
-            np.stack(
-                [f if f is not None else np.zeros(feat_dim) for f in static_feats]
-            ),
-            dtype=torch.float32,
-        )  # [num_nodes, feat_dim]
-
-        # -- Optional MLP projection -------------------------------------------
-        if mlp is not None:
-            mlp.eval()
-            device = next(mlp.parameters()).device
-            with torch.no_grad():
-                static_node_x = mlp(static_node_x.to(device)).cpu()
-            print(
-                f"[DGBatch] MLP projected node features: {feat_dim} → {static_node_x.shape[1]}"
-            )
-
+        static_feats = [
+            f if f is not None else np.zeros(self.embed_dim, dtype=np.float32)
+            for f in static_feats
+        ]
+        target_dim = max(f.shape[0] for f in static_feats)
+        padded = [np.pad(f, (0, target_dim - f.shape[0])) for f in static_feats]
+        static_node_x = torch.tensor(np.stack(padded), dtype=torch.float32)
         # -- Edges -------------------------------------------------------------
         edges = list(G.edges(data=True))
         if not edges:
@@ -756,13 +917,22 @@ class NodeFeaturiser:
                 "[DGBatch] Graph has no edges — call download_and_store() first."
             )
 
-        src_ids, dst_ids, edge_times, edge_feats = [], [], [], []
+        # ✅ Dynamic edge type vocab
+
+        if edge_types is not None:
+            self.edge_types = edge_types  # pin caller-supplied vocab before building
+        self.edge_types, type_to_idx = self._build_edge_type_vocab(edges)
+
+        src_ids, dst_ids, edge_times, edge_type_ids, edge_feats = [], [], [], [], []
 
         for src, dst, data in edges:
             src_ids.append(node_to_id[src])
             dst_ids.append(node_to_id[dst])
             t = data.get("time", data.get("timestamp", data.get("t", 0)))
             edge_times.append(float(t))
+            raw_type = data.get("type", "")
+            unk_idx = -1
+            edge_type_ids.append(type_to_idx.get(raw_type, unk_idx))
             ef = data.get("feature", data.get("edge_feature"))
             edge_feats.append(ef)
 
@@ -770,12 +940,17 @@ class NodeFeaturiser:
         edge_times = np.array(edge_times, dtype=np.float32)[order]
         src_ids = np.array(src_ids)[order]
         dst_ids = np.array(dst_ids)[order]
+        edge_type_ids = np.array(edge_type_ids)[order]
 
         edge_index = torch.tensor(
             np.stack([src_ids, dst_ids], axis=1), dtype=torch.long
         )
-        edge_time = torch.tensor(edge_times, dtype=torch.float32)
+        edge_time = torch.tensor(edge_times, dtype=torch.int32)
 
+        # ✅ edge_type as a dedicated LongTensor — no one-hot needed
+        edge_type = torch.tensor(edge_type_ids, dtype=torch.long)
+
+        # ✅ edge_x carries only continuous features, or None
         has_edge_feats = any(ef is not None for ef in edge_feats)
         if has_edge_feats:
             edge_feat_dim = next(len(ef) for ef in edge_feats if ef is not None)
@@ -793,9 +968,22 @@ class NodeFeaturiser:
         else:
             edge_x = None
 
+        # ✅ node_type: infer from graph node attribute, fallback to 0
+        self.node_types, node_type_to_idx = self._build_node_type_vocab()
+
+        node_type = torch.tensor(
+            [
+                node_type_to_idx.get(
+                    G.nodes[n].get("type", ""), node_type_to_idx["<unk>"]
+                )
+                for n in node_list
+            ],
+            dtype=torch.long,
+        )
+
         print(
             f"[DGBatch] {len(node_list)} nodes (feat_dim={static_node_x.shape[1]}), "
-            f"{len(edges)} edges, "
+            f"{len(edges)} edges (edge_dim={edge_x.shape[1] if edge_x is not None else 0}), "
             f"t=[{edge_times.min():.2f}, {edge_times.max():.2f}]"
         )
 
@@ -804,6 +992,8 @@ class NodeFeaturiser:
             edge_time=edge_time,
             edge_index=edge_index,
             edge_x=edge_x,
+            edge_type=edge_type,
+            node_type=node_type,
             static_node_x=static_node_x,
             node_y_time=None,
             node_y_nids=None,
