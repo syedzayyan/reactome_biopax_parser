@@ -405,6 +405,11 @@ class _ParserBase:
 
             reactome_db_id = None
 
+            members = [
+                m.get(RESOUCE_RDF_STRING, None).strip("#")
+                for m in complex.findall("biopax:memberPhysicalEntity", namespaces)
+            ]
+
             for c in comments:
                 if c.text and c.text.startswith("Reactome DB_ID:"):
                     reactome_db_id = c.text.replace("Reactome DB_ID:", "").strip()
@@ -413,6 +418,7 @@ class _ParserBase:
             self.complexes[complexId] = {
                 "name": disName,
                 "components": component,
+                "members": members,
                 "reactome_db_id": reactome_db_id,
                 "cellularLocation": self.cellularLocations.get(cellularLocation),
                 "xref": xref,
@@ -625,24 +631,36 @@ class _ParserBase:
                 paired_right.append(right_by_name[name])
 
         return paired_left, paired_right
+
     def _is_translocation(self, lefties: list, righties: list) -> bool:
-        """True only if the MAJORITY of paired entities are same-name, different-location."""
         all_stores = (self.proteins, self.molecules, self.dna, self.rna)
 
-        matched_pairs = 0
-        translocation_pairs = 0
+        def name_and_loc(eid):
+            for store in all_stores:
+                if eid in store:
+                    return store[eid]["name"], store[eid].get("cellularLocation")
+            return None, None
 
+        left_by_name = {}
         for l in lefties:
-            for r in righties:
-                for store in all_stores:
-                    if l in store and r in store:
-                        if store[l]["name"] == store[r]["name"]:
-                            matched_pairs += 1
-                            if store[l]["cellularLocation"] != store[r]["cellularLocation"]:
-                                translocation_pairs += 1
+            name, loc = name_and_loc(l)
+            if name:
+                left_by_name[name] = loc
 
-        if matched_pairs == 0:
+        if not left_by_name:
             return False
 
-        # Require >50% of name-matched pairs to differ in location
-        return (translocation_pairs / matched_pairs) > 0.5 and translocation_pairs == len(lefties)
+        translocation_count = 0
+        matched_count = 0
+        for r in righties:
+            name, r_loc = name_and_loc(r)
+            if name and name in left_by_name:
+                matched_count += 1
+                if left_by_name[name] != r_loc:
+                    translocation_count += 1
+
+        if matched_count == 0:
+            return False
+
+        # Majority of name-matched right entities must come from a different location
+        return (translocation_count / matched_count) > 0.5

@@ -21,3 +21,10 @@ tgat/
 modules/
 cache/
 .cache/
+go.obo
+go_node2vec_embeddings.pt
+go_node2vec_matrix.pt
+graph.json
+index.html
+obo2vec.py
+graph_mutant.json
