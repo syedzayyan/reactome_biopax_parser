@@ -325,9 +325,9 @@ class _ParserBase:
         )
 
         for catalysis in iterator:
-            controlType = catalysis.find("biopax:controlType", namespaces).text.strip(
-                "#"
-            )
+            ct_el = catalysis.find("biopax:controlType", namespaces)
+            controlType = ct_el.text.strip("#") if ct_el is not None else "ACTIVATION"
+
             controller = (
                 catalysis.find("biopax:controller", namespaces)
                 .get(RESOUCE_RDF_STRING, None)
@@ -595,14 +595,54 @@ class _ParserBase:
             # )
 
             is_translocation = self._is_translocation(lefties, righties)
+            is_broadcast = self._is_broadcast_reaction(lefties, righties)
 
             if is_translocation:
                 paired_left, paired_right = self._pair_translocation(lefties, righties)
                 self.reactions[ID] = (paired_left, paired_right, "translocation")
+            elif is_broadcast:
+                self.reactions[ID] = (lefties, righties, "broadcast")
             else:
                 self.reactions[ID] = (lefties, righties, "reaction")
 
         self._log("info", f"Parsed {len(self.reactions)} reactions ({skipped} skipped)")
+
+    def _is_broadcast_reaction(self, lefties: list, righties: list) -> bool:
+        """
+        A broadcast reaction produces each right-side entity independently
+        from the left — not a single combined product.
+
+        True transcription/expression events have:
+        - A small left side (1–3 entities) dominated by DNA
+        - A large right side (mostly proteins/complexes) that dwarfs the left
+
+        Returns True if this should emit L→each(R) edges rather than
+        cartesian(L) × cartesian(R).
+        """
+        if len(lefties) > 3:
+            return False
+
+        def _is_dna_entity(eid: str) -> bool:
+            if eid in self.dna:
+                return True
+            if eid in self.physical_entity:
+                members = self.physical_entity[eid].get("members", [])
+                return bool(members) and all(mid in self.dna for mid in members)
+            return False
+
+        dna_count = sum(1 for eid in lefties if _is_dna_entity(eid))
+        if dna_count / max(len(lefties), 1) <= 0.5:
+            return False
+
+        right_protein_count = sum(
+            1 for eid in righties if eid in self.proteins or eid in self.complexes
+        )
+        right_mostly_proteins = right_protein_count / max(len(righties), 1) > 0.8
+
+        # Right side must massively outnumber left (gene → many products)
+        fan_out = len(righties) >= len(lefties) * 5 and len(righties) > 5
+
+        return right_mostly_proteins and fan_out
 
     def _pair_translocation(self, lefties: list, righties: list):
         """

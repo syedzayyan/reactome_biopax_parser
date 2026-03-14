@@ -80,10 +80,7 @@ class _NxGraphMixin:
 
             # Record first step each complex appears in
             for entity_id in itertools.chain(left_entities, right_entities):
-                if entity_id in self.complexes:
-                    label = self._make_label_for_id(entity_id)
-                    if label and label not in complex_first_step:
-                        complex_first_step[label] = step
+                self._record_complex_step(entity_id, step, complex_first_step)
 
             # ------------------------------------------------------------------
             # Translocation branch
@@ -138,6 +135,28 @@ class _NxGraphMixin:
                                         catalysis_type=catalysis_exists["controlType"],
                                         pathway=pathway_name,
                                     )
+            elif reaction_type == "broadcast":
+                # Left side stays collapsed — the gene locus is a single logical source.
+                # Only flatten right side to individual protein leaves.
+                flat_right = self._flatten_or_members(right_entities)
+
+                for left in left_entities:  # <-- no flattening, use as-is
+                    left_label = self._make_label_for_id(left)
+                    if not left_label:
+                        continue
+                    G.add_node(left_label)
+                    for right in flat_right:
+                        right_label = self._make_label_for_id(right)
+                        if not right_label:
+                            continue
+                        G.add_node(right_label)
+                        G.add_edge(
+                            left_label,
+                            right_label,
+                            time=step,
+                            type="expression",
+                            pathway=pathway_name,
+                        )
 
             # ------------------------------------------------------------------
             # Normal reaction branch
@@ -234,6 +253,7 @@ class _NxGraphMixin:
         self._annotate_nodes(G)
 
         self._log("info", "Graph construction complete")
+        self._debug_cfs = complex_first_step
         return self.finalize_graph(G)
 
     def finalize_graph(self, G, verbose=False):
@@ -378,6 +398,12 @@ class _NxGraphMixin:
             label = self._make_label(self.complexes[cid]["name"], self.complexes[cid])
             if label in complex_first_step:
                 wire(cid, complex_first_step[label])
+
+        fallback_step = max(complex_first_step.values(), default=0)
+        for cid in self.complexes:
+            label = self._make_label(self.complexes[cid]["name"], self.complexes[cid])
+            if label in G.nodes and label not in complex_first_step:
+                wire(cid, fallback_step)
 
     def _resolve_or_leaves(self, eid: str, visiting: frozenset = frozenset()) -> list:
         """
@@ -534,6 +560,8 @@ class _NxGraphMixin:
 
                 out_edges = list(G.out_edges(parent_label, data=True))
                 in_edges = list(G.in_edges(parent_label, data=True))
+                if any(d.get("type") == "expression" for _, _, d in out_edges):
+                    continue
 
                 for leaf_id, leaf_data, leaf_type in leaf_entities:
                     leaf_label = self._make_label(leaf_data["name"], leaf_data)
@@ -548,7 +576,14 @@ class _NxGraphMixin:
 
         # Sweep any [OR] nodes that buildComplexHierarchy may have re-introduced
         # as intermediate complex components pointing to OR-parents
-        or_survivors = [n for n in G.nodes if str(n).startswith("[OR]")]
+        or_survivors = [
+            n
+            for n in G.nodes
+            if str(n).startswith("[OR]")
+            and not any(
+                d.get("type") == "expression" for _, _, d in G.out_edges(n, data=True)
+            )
+        ]
         if or_survivors:
             self._log("debug", f"Sweeping {len(or_survivors)} surviving [OR] nodes")
             G.remove_nodes_from(or_survivors)
@@ -569,9 +604,16 @@ class _NxGraphMixin:
             (self.complexes, "complex"),
         ]:
             for entity_id, entity_data in store.items():
-                if entity_data.get("members"):
-                    continue
                 label = self._make_label(entity_data["name"], entity_data)
+                if entity_data.get("members"):
+                    # Preserved OR-group (e.g. gene locus with expression edges):
+                    # annotate as the parent store's type rather than skipping.
+                    if label in G.nodes and any(
+                        d.get("type") == "expression"
+                        for _, _, d in G.out_edges(label, data=True)
+                    ):
+                        label_to_annotation[label] = (node_type, entity_data)
+                    continue
                 label_to_annotation[label] = (node_type, entity_data)
 
         for node in G.nodes:
@@ -744,3 +786,37 @@ class _NxGraphMixin:
                 break
         self._name_cache[entity_id] = name
         return name
+
+    def _record_complex_step(
+        self,
+        entity_id: str,
+        step: int,
+        registry: dict,
+        visiting: frozenset = frozenset(),
+    ):
+        """Iterative BFS registration — avoids recursion limit on deep complexes."""
+        stack = [(entity_id, frozenset())]
+        while stack:
+            cid, visited = stack.pop()
+            if cid not in self.complexes or cid in visited:
+                continue
+            label = self._make_label_for_id(cid)
+            if label and label not in registry:
+                registry[label] = step
+            visited = visited | {cid}
+            for comp_id in self.complexes[cid].get("components", []):
+                if comp_id in self.complexes and comp_id not in visited:
+                    stack.append((comp_id, visited))
+
+    def _flatten_or_members(self, entity_list: list) -> list:
+        """Like _expand_single_entity but flattens all OR-groups to leaves,
+        no cartesian product — just a flat union of all member IDs."""
+        result = []
+        seen = set()
+        for eid in entity_list:
+            members = self._expand_single_entity(eid)
+            for mid in members:
+                if mid not in seen:
+                    seen.add(mid)
+                    result.append(mid)
+        return result
