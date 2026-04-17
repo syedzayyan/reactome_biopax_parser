@@ -296,56 +296,176 @@ def fit_rem(
     all_edge_types,
     N_MARKS: int,
     t_max: int,
+    n_neg: int = 20,
+    seed: int = 42,
 ):
+    """
+    Approximate REM via case-control partial likelihood.
+
+    For each observed event (u,v,t), sample n_neg alternative dyads from the
+    risk set at time t and fit a binary conditional-choice model:
+        y = 1 for observed dyad
+        y = 0 for sampled non-event dyads
+
+    This is much closer to a true REM than the previous multinomial classifier:
+    it models which dyad occurs at time t given competing alternatives.
+
+    Notes
+    -----
+    - This predicts whether a dyad is the realised event at time t.
+    - It does NOT model exact waiting times via full interval likelihood.
+    - Edge type prediction is produced by a second lightweight classifier on
+      observed events only, since your evaluation still asks for type labels.
+    """
+    rng = random.Random(seed)
+
+    # Global node list inferred from training events
+    nodes = sorted({u for u, _, _ in train_seq} | {v for _, v, _ in train_seq})
+
     def rem_feature(u, v, t: int) -> np.ndarray:
-        return np.concatenate([edge_feature(u, v), feat_bias(u, v), get_history(t)])
+        return np.concatenate(
+            [
+                edge_feature(u, v),
+                feat_bias(u, v),
+                get_history(t).astype(np.float32),
+            ]
+        ).astype(np.float32)
 
-    type_counts = np.bincount(
-        etype_le.transform([d.get("type", "unknown") for _, _, d in train_seq]),
-        minlength=N_MARKS,
-    ).astype(float)
-    class_weights = dict(enumerate(1.0 / (type_counts + 1.0)))
+    def sample_risk_dyads(u_obs, v_obs, t: int, n_samples: int):
+        """
+        Sample alternative dyads from the risk set at time t.
+        Current approximation: all ordered pairs over known nodes, excluding self-loops
+        and excluding the observed dyad.
+        """
+        out = set()
+        max_tries = max(100, 20 * n_samples)
+        tries = 0
+        while len(out) < n_samples and tries < max_tries:
+            s = rng.choice(nodes)
+            r = rng.choice(nodes)
+            tries += 1
+            if s == r:
+                continue
+            if s == u_obs and r == v_obs:
+                continue
+            out.add((s, r))
+        return list(out)
 
-    print("\n[Stage 2 — REM] Fitting Relational Event Model...")
-    X_type = np.array(
-        [rem_feature(u, v, int(d.get("time", 0))) for u, v, d in train_seq]
-    )
-    y_type = np.array(
-        [etype_le.transform([d.get("type", "unknown")])[0] for _, _, d in train_seq]
-    )
+    print("\n[Stage 2 — REM] Building case-control dataset...")
 
-    clf = Pipeline(
+    # ------------------------------------------------------------------
+    # A. Dyad-choice model: observed event vs sampled risk-set non-events
+    # ------------------------------------------------------------------
+    X_evt, y_evt, w_evt = [], [], []
+
+    for u, v, d in train_seq:
+        t = int(d.get("time", 0))
+
+        # positive: realised dyad
+        X_evt.append(rem_feature(u, v, t))
+        y_evt.append(1)
+        w_evt.append(1.0)
+
+        # negatives: sampled alternative dyads
+        neg_dyads = sample_risk_dyads(u, v, t, n_neg)
+        for s, r in neg_dyads:
+            X_evt.append(rem_feature(s, r, t))
+            y_evt.append(0)
+            w_evt.append(1.0 / max(n_neg, 1))
+
+    X_evt = np.array(X_evt, dtype=np.float32)
+    y_evt = np.array(y_evt, dtype=np.int64)
+    w_evt = np.array(w_evt, dtype=np.float32)
+
+    event_clf = Pipeline(
         [
             ("scaler", StandardScaler()),
             (
                 "lr",
                 LogisticRegression(
-                    max_iter=1000, class_weight=class_weights, solver="lbfgs"
+                    max_iter=2000,
+                    class_weight="balanced",
+                    solver="lbfgs",
                 ),
             ),
         ]
     )
-    clf.fit(X_type, y_type)
-    print("[Stage 2 — REM] Done.")
+    event_clf.fit(X_evt, y_evt, lr__sample_weight=w_evt)
+    print("[Stage 2 — REM] Dyad-choice model done.")
 
-    # Shared time regressor
+    # ------------------------------------------------------------------
+    # B. Mark/type model on realised events only
+    # ------------------------------------------------------------------
+    print("[Stage 2 — REM] Fitting mark/type model on realised events...")
+
+    X_type = np.array(
+        [rem_feature(u, v, int(d.get("time", 0))) for u, v, d in train_seq],
+        dtype=np.float32,
+    )
+    y_type = np.array(
+        [etype_le.transform([d.get("type", "unknown")])[0] for _, _, d in train_seq],
+        dtype=np.int64,
+    )
+
+    type_counts = np.bincount(y_type, minlength=N_MARKS).astype(float)
+    class_weights = dict(enumerate(1.0 / (type_counts + 1.0)))
+
+    type_clf = Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            (
+                "lr",
+                LogisticRegression(
+                    max_iter=2000,
+                    class_weight=class_weights,
+                    solver="lbfgs",
+                ),
+            ),
+        ]
+    )
+    type_clf.fit(X_type, y_type)
+    print("[Stage 2 — REM] Mark/type model done.")
+
+    # ------------------------------------------------------------------
+    # C. Shared time regressor (keep your current evaluation protocol)
+    # ------------------------------------------------------------------
     predict_time = fit_time_regressor(train_seq, edge_feature, get_history, t_max)
 
+    # ------------------------------------------------------------------
+    # D. Prediction API
+    # ------------------------------------------------------------------
     def predict_type(u, v, t: int) -> int:
-        return int(clf.predict(rem_feature(u, v, t).reshape(1, -1))[0])
+        x = rem_feature(u, v, t).reshape(1, -1)
+        return int(type_clf.predict(x)[0])
 
     def predict_proba(u, v, t: int) -> np.ndarray:
-        return clf.predict_proba(rem_feature(u, v, t).reshape(1, -1))[0]
+        x = rem_feature(u, v, t).reshape(1, -1)
+        return type_clf.predict_proba(x)[0]
+
+    def predict_event_score(u, v, t: int) -> float:
+        """
+        REM-style dyad score: probability that (u,v) is the realised dyad
+        against sampled alternatives. This is the closest thing here to the
+        REM intensity ranking signal.
+        """
+        x = rem_feature(u, v, t).reshape(1, -1)
+        return float(event_clf.predict_proba(x)[0, 1])
 
     def predict_order_score(u, v, t: int) -> float:
-        # ← now returns predicted t_norm, not classifier confidence
+        """
+        Keep the temporally grounded score for your current Task 3 evaluation.
+        If you want pure REM ranking instead, replace this with predict_event_score.
+        """
         return predict_time(u, v, t)
 
     return {
         "predict_type": predict_type,
         "predict_proba": predict_proba,
+        "predict_event_score": predict_event_score,
         "predict_order_score": predict_order_score,
         "rem_feature": rem_feature,
+        "event_clf": event_clf,
+        "type_clf": type_clf,
     }
 
 
@@ -634,6 +754,7 @@ def evaluate(
     t_max: int,
     sample_negative_fn,
     name: str,
+    predict_event_score_fn=None,
     use_rank_normalise: bool = False,
 ) -> dict:
     """
@@ -647,7 +768,21 @@ def evaluate(
     X_pos = np.array([edge_feature(u, v) for u, v, _ in edges])
     X_neg = np.array([edge_feature(u, v_n) for u, v_n, _ in neg_edges])
     y_ev = np.array([1] * len(edges) + [0] * len(neg_edges))
-    auc = roc_auc_score(y_ev, exist_clf.predict_proba(np.vstack([X_pos, X_neg]))[:, 1])
+
+    if predict_event_score_fn is not None:
+        # REM: use dyad-choice model for existence scoring
+        pos_scores = [
+            predict_event_score_fn(u, v, int(d.get("time", 0))) for u, v, d in edges
+        ]
+        neg_scores = [
+            predict_event_score_fn(u, v_n, int(d.get("time", 0)))
+            for u, v_n, d in neg_edges
+        ]
+        auc = roc_auc_score(y_ev, np.array(pos_scores + neg_scores))
+    else:
+        auc = roc_auc_score(
+            y_ev, exist_clf.predict_proba(np.vstack([X_pos, X_neg]))[:, 1]
+        )
 
     # Tasks 2 & 3
     type_preds, type_labels = [], []
