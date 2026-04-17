@@ -18,13 +18,11 @@ _PALETTE = {
     "bg": "#ffffff",
     "fg": "#2e3440",
     "grid": "#e6e9ef",
-    # node types
     "protein": "#4c78a8",
     "molecule": "#59a14f",
     "complex": "#b279a2",
     "physical": "#f28e2b",
     "other": "#9aa1a6",
-    # edge types
     "reaction": "#4c78a8",
     "catalysis": "#e15759",
     "reaction_partner": "#8cd17d",
@@ -47,7 +45,6 @@ _EDGE_COLOR = {
     "translocation": "#76b7b2",
 }
 
-# Paper-friendly rcParams
 _PAPER_RC = {
     "font.family": "sans-serif",
     "font.size": 8,
@@ -68,14 +65,14 @@ _PAPER_RC = {
 }
 
 
-def _style(fig: plt.Figure, axes):
+def _style(fig: plt.Figure, axes, fontsize: int = 8):
     """Apply clean white theme to figure and one or more axes."""
     fig.patch.set_facecolor(_PALETTE["bg"])
     if not hasattr(axes, "__iter__"):
         axes = [axes]
     for ax in axes:
         ax.set_facecolor(_PALETTE["bg"])
-        ax.tick_params(colors=_PALETTE["fg"], labelsize=7)
+        ax.tick_params(colors=_PALETTE["fg"], labelsize=fontsize - 1)
         ax.xaxis.label.set_color(_PALETTE["fg"])
         ax.yaxis.label.set_color(_PALETTE["fg"])
         ax.title.set_color(_PALETTE["fg"])
@@ -85,7 +82,7 @@ def _style(fig: plt.Figure, axes):
 
 
 def _panel_label(ax: plt.Axes, label: str, fontsize: int = 11):
-    """Add a bold lowercase panel label (a, b, c, d) to the top-left of an axis."""
+    """Add a bold lowercase panel label to the top-left of an axis."""
     ax.text(
         -0.12,
         1.06,
@@ -97,6 +94,17 @@ def _panel_label(ax: plt.Axes, label: str, fontsize: int = 11):
         ha="left",
         color=_PALETTE["fg"],
     )
+
+
+def _percentile_limits(
+    values: np.ndarray,
+    lower_pct: float = 0.0,
+    upper_pct: float = 99.0,
+) -> tuple[float, float]:
+    lo = float(np.percentile(values, lower_pct))
+    hi = float(np.percentile(values, upper_pct))
+    pad = (hi - lo) * 0.05 if hi > lo else 1.0
+    return max(0.0, lo - pad), hi + pad
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -210,7 +218,11 @@ class ReactomeViz:
 
     # ── individual plots ──────────────────────────────────────────────────────
 
-    def plot_edge_growth(self, ax: Optional[plt.Axes] = None) -> plt.Figure:
+    def plot_edge_growth(
+        self,
+        fontsize: int = 9,
+        ax: Optional[plt.Axes] = None,
+    ) -> plt.Figure:
         """Cumulative edge count over reaction steps, broken down by edge type."""
         show = ax is None
         fig, ax = plt.subplots(figsize=(9, 4)) if show else (ax.get_figure(), ax)
@@ -238,17 +250,21 @@ class ReactomeViz:
             )
             bottom = bottom + vals
 
-        ax.set_xlabel("Reaction step")
-        ax.set_ylabel("Cumulative edges")
-        ax.set_title("Edge Growth by Type")
-        ax.legend(fontsize=7, framealpha=0.2, labelcolor=_PALETTE["fg"])
-        _style(fig, ax)
+        ax.set_xlabel("Reaction step", fontsize=fontsize)
+        ax.set_ylabel("Cumulative edges", fontsize=fontsize)
+        ax.set_title("Edge Growth by Type", fontsize=fontsize + 1)
+        ax.legend(fontsize=fontsize - 1, framealpha=0.2, labelcolor=_PALETTE["fg"])
+        _style(fig, ax, fontsize=fontsize)
         if show:
             plt.tight_layout()
             plt.show()
         return fig
 
-    def plot_node_recruitment(self, ax: Optional[plt.Axes] = None) -> plt.Figure:
+    def plot_node_recruitment(
+        self,
+        fontsize: int = 9,
+        ax: Optional[plt.Axes] = None,
+    ) -> plt.Figure:
         """How many new nodes appear at each reaction step."""
         show = ax is None
         fig, ax = plt.subplots(figsize=(9, 4)) if show else (ax.get_figure(), ax)
@@ -275,13 +291,13 @@ class ReactomeViz:
             label="Cumulative nodes",
         )
 
-        ax.set_xlabel("Reaction step")
-        ax.set_ylabel("New nodes", color=_PALETTE["protein"])
-        ax2.set_ylabel("Cumulative nodes", color=_PALETTE["catalysis"])
-        ax.set_title("Node Recruitment Over Time")
-        ax2.tick_params(colors=_PALETTE["fg"], labelsize=7)
+        ax.set_xlabel("Reaction step", fontsize=fontsize)
+        ax.set_ylabel("New nodes", fontsize=fontsize, color=_PALETTE["protein"])
+        ax2.set_ylabel("Cumulative nodes", fontsize=fontsize, color=_PALETTE["catalysis"])
+        ax.set_title("Node Recruitment Over Time", fontsize=fontsize + 1)
+        ax2.tick_params(colors=_PALETTE["fg"], labelsize=fontsize - 1)
         ax2.yaxis.label.set_color(_PALETTE["fg"])
-        _style(fig, ax)
+        _style(fig, ax, fontsize=fontsize)
         ax2.set_facecolor(_PALETTE["bg"])
         if show:
             plt.tight_layout()
@@ -289,7 +305,10 @@ class ReactomeViz:
         return fig
 
     def plot_degree_distribution(
-        self, log_scale: bool = True, ax: Optional[plt.Axes] = None
+        self,
+        log_scale: bool = True,
+        fontsize: int = 9,
+        ax: Optional[plt.Axes] = None,
     ) -> plt.Figure:
         """Degree distribution, optionally on log-log axes."""
         show = ax is None
@@ -307,53 +326,104 @@ class ReactomeViz:
             ax.set_xscale("log")
             ax.set_yscale("log")
 
-        ax.set_xlabel("Degree")
-        ax.set_ylabel("Count")
-        ax.set_title("Degree Distribution" + (" (log–log)" if log_scale else ""))
-        _style(fig, ax)
+        ax.set_xlabel("Degree", fontsize=fontsize)
+        ax.set_ylabel("Count", fontsize=fontsize)
+        ax.set_title(
+            "Degree Distribution" + (" (log–log)" if log_scale else ""),
+            fontsize=fontsize + 1,
+        )
+        _style(fig, ax, fontsize=fontsize)
         if show:
             plt.tight_layout()
             plt.show()
         return fig
 
-    def plot_in_vs_out_degree(self, ax: Optional[plt.Axes] = None) -> plt.Figure:
-        """Scatter of in-degree vs out-degree, coloured by node type."""
+    def plot_in_vs_out_degree(
+        self,
+        remove_outliers: bool = True,
+        upper_percentile: float = 99.0,
+        fontsize: int = 9,
+        ax: Optional[plt.Axes] = None,
+    ) -> plt.Figure:
+        """
+        Scatter of in-degree vs out-degree, coloured by node type.
+
+        Parameters
+        ----------
+        remove_outliers : bool
+            Clip axis limits at ``upper_percentile`` to avoid hub compression.
+        upper_percentile : float
+            Percentile for the upper axis limit (default 99).
+        fontsize : int
+            Font size for labels, ticks, title, and legend (default 9).
+        ax : plt.Axes, optional
+            Existing axes to draw into. If None a new figure is created.
+        """
         show = ax is None
         fig, ax = plt.subplots(figsize=(7, 6)) if show else (ax.get_figure(), ax)
 
         type_data: dict[str, tuple[list, list]] = defaultdict(lambda: ([], []))
+        all_in: list[int] = []
+        all_out: list[int] = []
+
         for n, d in self.G.nodes(data=True):
             ntype = d.get("type", "other")
             in_d = self.G.in_degree(n)
             out_d = self.G.out_degree(n)
             type_data[ntype][0].append(in_d)
             type_data[ntype][1].append(out_d)
+            all_in.append(in_d)
+            all_out.append(out_d)
 
         for ntype, (xs, ys) in type_data.items():
             color = _TYPE_COLOR.get(ntype, _PALETTE["other"])
             ax.scatter(xs, ys, s=10, alpha=0.55, color=color, label=ntype)
 
+        if remove_outliers and all_in and all_out:
+            x_lo, x_hi = _percentile_limits(np.array(all_in), 0.0, upper_percentile)
+            y_lo, y_hi = _percentile_limits(np.array(all_out), 0.0, upper_percentile)
+            ax.set_xlim(x_lo, x_hi)
+            ax.set_ylim(y_lo, y_hi)
+
         lim = max(ax.get_xlim()[1], ax.get_ylim()[1])
         ax.plot(
-            [0, lim],
-            [0, lim],
-            color=_PALETTE["grid"],
-            linewidth=0.8,
-            linestyle="--",
-            zorder=0,
+            [0, lim], [0, lim],
+            color=_PALETTE["grid"], linewidth=0.8, linestyle="--", zorder=0,
         )
 
-        ax.set_xlabel("In-degree")
-        ax.set_ylabel("Out-degree")
-        ax.set_title("In-degree vs Out-degree by Entity Type")
-        ax.legend(fontsize=7, framealpha=0.2, labelcolor=_PALETTE["fg"])
-        _style(fig, ax)
+        ax.set_xlabel("In-degree", fontsize=fontsize)
+        ax.set_ylabel("Out-degree", fontsize=fontsize)
+        ax.set_title("In-degree vs Out-degree by Entity Type", fontsize=fontsize + 1)
+        ax.tick_params(labelsize=fontsize - 1)
+        ax.legend(fontsize=fontsize - 1, framealpha=0.2, labelcolor=_PALETTE["fg"])
+
+        if remove_outliers:
+            x_hi = ax.get_xlim()[1]
+            y_hi = ax.get_ylim()[1]
+            n_clipped = sum(
+                1 for xi, yi in zip(all_in, all_out) if xi > x_hi or yi > y_hi
+            )
+            if n_clipped:
+                ax.text(
+                    0.98, 0.02,
+                    f"{n_clipped} outlier{'s' if n_clipped != 1 else ''} not shown",
+                    transform=ax.transAxes,
+                    ha="right", va="bottom",
+                    fontsize=max(fontsize - 2, 6),
+                    color=_PALETTE["other"], style="italic",
+                )
+
+        _style(fig, ax, fontsize=fontsize)
         if show:
             plt.tight_layout()
             plt.show()
         return fig
 
-    def plot_node_type_breakdown(self, ax: Optional[plt.Axes] = None) -> plt.Figure:
+    def plot_node_type_breakdown(
+        self,
+        fontsize: int = 9,
+        ax: Optional[plt.Axes] = None,
+    ) -> plt.Figure:
         """Horizontal bar chart of node counts per entity type."""
         show = ax is None
         fig, ax = plt.subplots(figsize=(7, 3.5)) if show else (ax.get_figure(), ax)
@@ -370,19 +440,25 @@ class ReactomeViz:
                 f"{val:,}",
                 va="center",
                 color=_PALETTE["fg"],
-                fontsize=8,
+                fontsize=fontsize - 1,
             )
 
-        ax.set_xlabel("Node count")
-        ax.set_title("Node Types")
-        _style(fig, ax)
+        ax.set_xlabel("Node count", fontsize=fontsize)
+        ax.set_title("Node Types", fontsize=fontsize + 1)
+        # y-tick labels are the type names — angle them so they never clip
+        plt.setp(ax.get_yticklabels(), fontsize=fontsize - 1, rotation=0, ha="right")
+        _style(fig, ax, fontsize=fontsize)
         if show:
             plt.tight_layout()
             plt.show()
         return fig
 
-    def plot_edge_type_breakdown(self, ax: Optional[plt.Axes] = None) -> plt.Figure:
-        """Horizontal bar chart of edge counts per edge type, matching node type style."""
+    def plot_edge_type_breakdown(
+        self,
+        fontsize: int = 9,
+        ax: Optional[plt.Axes] = None,
+    ) -> plt.Figure:
+        """Horizontal bar chart of edge counts per edge type."""
         show = ax is None
         fig, ax = plt.subplots(figsize=(7, 3.5)) if show else (ax.get_figure(), ax)
 
@@ -398,26 +474,30 @@ class ReactomeViz:
                 f"{val:,}",
                 va="center",
                 color=_PALETTE["fg"],
-                fontsize=8,
+                fontsize=fontsize - 1,
             )
 
-        ax.set_xlabel("Edge count")
-        ax.set_title("Edge Types")
-        _style(fig, ax)
+        ax.set_xlabel("Edge count", fontsize=fontsize)
+        ax.set_title("Edge Types", fontsize=fontsize + 1)
+        plt.setp(ax.get_yticklabels(), fontsize=fontsize - 1, rotation=0, ha="right")
+        _style(fig, ax, fontsize=fontsize)
         if show:
             plt.tight_layout()
             plt.show()
         return fig
 
     def plot_cellular_location(
-        self, top_n: int = 12, ax: Optional[plt.Axes] = None
+        self,
+        top_n: int = 12,
+        fontsize: int = 9,
+        ax: Optional[plt.Axes] = None,
     ) -> plt.Figure:
         """Bar chart of node counts per cellular location."""
         show = ax is None
         fig, ax = plt.subplots(figsize=(9, 4)) if show else (ax.get_figure(), ax)
 
         most_common = self._location_counts.most_common(top_n)
-        labels = [l for l, _ in most_common]
+        labels = [lbl for lbl, _ in most_common]
         counts = [c for _, c in most_common]
 
         cmap = plt.cm.get_cmap("cool", len(labels))
@@ -425,17 +505,22 @@ class ReactomeViz:
 
         ax.bar(range(len(labels)), counts, color=colors)
         ax.set_xticks(range(len(labels)))
-        ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=7)
-        ax.set_ylabel("Node count")
-        ax.set_title(f"Top {top_n} Cellular Locations")
-        _style(fig, ax)
+        # Angle x-tick labels so long location names never collide
+        ax.set_xticklabels(labels, rotation=40, ha="right", fontsize=fontsize - 1)
+        ax.set_ylabel("Node count", fontsize=fontsize)
+        ax.set_title(f"Top {top_n} Cellular Locations", fontsize=fontsize + 1)
+        _style(fig, ax, fontsize=fontsize)
+        # Extra bottom padding to accommodate rotated labels
         if show:
             plt.tight_layout()
             plt.show()
         return fig
 
     def plot_catalyst_reuse(
-        self, top_n: int = 20, ax: Optional[plt.Axes] = None
+        self,
+        top_n: int = 20,
+        fontsize: int = 9,
+        ax: Optional[plt.Axes] = None,
     ) -> plt.Figure:
         """Bar chart of catalysts ranked by number of reactions they control."""
         show = ax is None
@@ -449,15 +534,12 @@ class ReactomeViz:
         most_common = catalyst_counts.most_common(top_n)
         if not most_common:
             ax.text(
-                0.5,
-                0.5,
-                "No catalysis edges found",
-                ha="center",
-                va="center",
-                color=_PALETTE["fg"],
+                0.5, 0.5, "No catalysis edges found",
+                ha="center", va="center",
+                color=_PALETTE["fg"], fontsize=fontsize,
                 transform=ax.transAxes,
             )
-            _style(fig, ax)
+            _style(fig, ax, fontsize=fontsize)
             if show:
                 plt.tight_layout()
                 plt.show()
@@ -465,22 +547,27 @@ class ReactomeViz:
 
         labels = [n for n, _ in most_common]
         counts = [c for _, c in most_common]
-        short_labels = [l[:28] + "…" if len(l) > 30 else l for l in labels]
+        # Shorten long catalyst names and angle them slightly on the y-axis
+        short_labels = [lbl[:28] + "…" if len(lbl) > 30 else lbl for lbl in labels]
 
         ax.barh(range(len(labels)), counts, color=_PALETTE["catalysis"], height=0.6)
         ax.set_yticks(range(len(labels)))
-        ax.set_yticklabels(short_labels, fontsize=7)
+        ax.set_yticklabels(short_labels, fontsize=fontsize - 1)
+        # Rotate y-tick labels at a gentle angle so overlapping names separate
+        plt.setp(ax.get_yticklabels(), rotation=15, ha="right", fontsize=fontsize - 1)
         ax.invert_yaxis()
-        ax.set_xlabel("Reactions catalysed")
-        ax.set_title(f"Top {top_n} Most Reused Catalysts")
-        _style(fig, ax)
+        ax.set_xlabel("Reactions catalysed", fontsize=fontsize)
+        ax.set_title(f"Top {top_n} Most Reused Catalysts", fontsize=fontsize + 1)
+        _style(fig, ax, fontsize=fontsize)
         if show:
             plt.tight_layout()
             plt.show()
         return fig
 
     def plot_reaction_size_distribution(
-        self, ax: Optional[plt.Axes] = None
+        self,
+        fontsize: int = 9,
+        ax: Optional[plt.Axes] = None,
     ) -> plt.Figure:
         """Histogram of reaction sizes (number of unique nodes per reaction step)."""
         show = ax is None
@@ -495,36 +582,34 @@ class ReactomeViz:
         sizes = [len(nodes) for nodes in step_nodes.values()]
         if not sizes:
             ax.text(
-                0.5,
-                0.5,
-                "No reaction edges found",
-                ha="center",
-                va="center",
-                color=_PALETTE["fg"],
+                0.5, 0.5, "No reaction edges found",
+                ha="center", va="center",
+                color=_PALETTE["fg"], fontsize=fontsize,
                 transform=ax.transAxes,
             )
         else:
             bins = range(min(sizes), max(sizes) + 2)
             ax.hist(
-                sizes,
-                bins=bins,
-                color=_PALETTE["molecule"],
-                alpha=0.8,
-                edgecolor=_PALETTE["bg"],
-                linewidth=0.5,
+                sizes, bins=bins,
+                color=_PALETTE["molecule"], alpha=0.8,
+                edgecolor=_PALETTE["bg"], linewidth=0.5,
             )
 
-        ax.set_xlabel("Unique nodes per reaction step")
-        ax.set_ylabel("Count")
-        ax.set_title("Reaction Size Distribution")
-        _style(fig, ax)
+        ax.set_xlabel("Unique nodes per reaction step", fontsize=fontsize)
+        ax.set_ylabel("Count", fontsize=fontsize)
+        ax.set_title("Reaction Size Distribution", fontsize=fontsize + 1)
+        # Angle x-ticks so numeric labels don't crowd at larger fontsizes
+        plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=fontsize - 1)
+        _style(fig, ax, fontsize=fontsize)
         if show:
             plt.tight_layout()
             plt.show()
         return fig
 
     def plot_connected_components_over_time(
-        self, ax: Optional[plt.Axes] = None
+        self,
+        fontsize: int = 9,
+        ax: Optional[plt.Axes] = None,
     ) -> plt.Figure:
         """How the number of weakly connected components evolves over time."""
         show = ax is None
@@ -539,16 +624,12 @@ class ReactomeViz:
                 G_running.add_edge(u, v, **d)
             component_counts.append(nx.number_weakly_connected_components(G_running))
 
-        ax.plot(
-            steps, component_counts, color=_PALETTE["reaction_partner"], linewidth=1.5
-        )
-        ax.fill_between(
-            steps, component_counts, alpha=0.2, color=_PALETTE["reaction_partner"]
-        )
-        ax.set_xlabel("Reaction step")
-        ax.set_ylabel("Weakly connected components")
-        ax.set_title("Network Fragmentation Over Time")
-        _style(fig, ax)
+        ax.plot(steps, component_counts, color=_PALETTE["reaction_partner"], linewidth=1.5)
+        ax.fill_between(steps, component_counts, alpha=0.2, color=_PALETTE["reaction_partner"])
+        ax.set_xlabel("Reaction step", fontsize=fontsize)
+        ax.set_ylabel("Weakly connected components", fontsize=fontsize)
+        ax.set_title("Network Fragmentation Over Time", fontsize=fontsize + 1)
+        _style(fig, ax, fontsize=fontsize)
         if show:
             plt.tight_layout()
             plt.show()
@@ -556,19 +637,25 @@ class ReactomeViz:
 
     # ── paper dashboard ───────────────────────────────────────────────────────
 
-    def dashboard(self, figsize=(18, 24)) -> plt.Figure:
+    def dashboard(self, figsize=(18, 24), fontsize: int = 11) -> plt.Figure:
         """
         Render all plots in a paper-friendly dashboard.
 
         Layout (4 columns × 5 rows)
         ------
-        row 0:  a  edge growth (spans cols 0-2)          node recruitment (col 3)
-        row 1:  b  node types  (col 0)    edge types (col 1)   degree dist (cols 2-3)
-        row 2:  c  in vs out (cols 0-1)   cellular location (cols 2-3)
-        row 3:  d  catalyst reuse (cols 0-2)              reaction size (col 3)
-        row 4:     connected components (spans all 4)
+        row 0:  a  edge growth (cols 0-2)       node recruitment (col 3)
+        row 1:  b  node types (col 0)   edge types (col 1)   degree dist (cols 2-3)
+        row 2:  c  in vs out (cols 0-1)          cellular location (cols 2-3)
+        row 3:  d  catalyst reuse (cols 0-2)     reaction size (col 3)
+        row 4:     connected components (all 4)
 
-        Panels a–d are the four primary figures for paper inclusion.
+        Parameters
+        ----------
+        figsize : tuple
+            Overall figure dimensions (width, height) in inches.
+        fontsize : int
+            Base font size propagated to all subplots, labels, ticks, legends,
+            and panel letters (default 11).
 
         Returns
         -------
@@ -578,60 +665,56 @@ class ReactomeViz:
             fig = plt.figure(figsize=figsize)
             fig.patch.set_facecolor(_PALETTE["bg"])
 
+            # Extra bottom/left margin to absorb rotated tick labels at larger
+            # fontsizes; hspace increased so row titles don't overlap x-ticks
             gs = fig.add_gridspec(
-                5,
-                4,
-                hspace=0.55,
-                wspace=0.40,
-                left=0.07,
+                5, 4,
+                hspace=0.72,
+                wspace=0.48,
+                left=0.09,
                 right=0.97,
                 top=0.96,
-                bottom=0.04,
+                bottom=0.06,
             )
 
-            # row 0
-            ax_edge_growth = fig.add_subplot(gs[0, :3])
+            # ── row 0 ──────────────────────────────────────────────────────
+            ax_edge_growth  = fig.add_subplot(gs[0, :3])
             ax_node_recruit = fig.add_subplot(gs[0, 3])
-            # row 1
-            ax_node_types = fig.add_subplot(gs[1, 0])
-            ax_edge_types = fig.add_subplot(gs[1, 1])
-            ax_degree = fig.add_subplot(gs[1, 2:])
-            # row 2
-            ax_in_out = fig.add_subplot(gs[2, :2])
-            ax_location = fig.add_subplot(gs[2, 2:])
-            # row 3
-            ax_catalyst = fig.add_subplot(gs[3, :3])
-            ax_rxn_size = fig.add_subplot(gs[3, 3])
-            # row 4
-            ax_components = fig.add_subplot(gs[4, :])
+            # ── row 1 ──────────────────────────────────────────────────────
+            ax_node_types   = fig.add_subplot(gs[1, 0])
+            ax_edge_types   = fig.add_subplot(gs[1, 1])
+            ax_degree       = fig.add_subplot(gs[1, 2:])
+            # ── row 2 ──────────────────────────────────────────────────────
+            ax_in_out       = fig.add_subplot(gs[2, :2])
+            ax_location     = fig.add_subplot(gs[2, 2:])
+            # ── row 3 ──────────────────────────────────────────────────────
+            ax_catalyst     = fig.add_subplot(gs[3, :3])
+            ax_rxn_size     = fig.add_subplot(gs[3, 3])
+            # ── row 4 ──────────────────────────────────────────────────────
+            ax_components   = fig.add_subplot(gs[4, :])
 
-            self.plot_edge_growth(ax=ax_edge_growth)
-            self.plot_node_recruitment(ax=ax_node_recruit)
-            self.plot_node_type_breakdown(ax=ax_node_types)
-            self.plot_edge_type_breakdown(ax=ax_edge_types)
-            self.plot_degree_distribution(ax=ax_degree)
-            self.plot_in_vs_out_degree(ax=ax_in_out)
-            self.plot_cellular_location(top_n=10, ax=ax_location)
-            self.plot_catalyst_reuse(ax=ax_catalyst)
-            self.plot_reaction_size_distribution(ax=ax_rxn_size)
-            self.plot_connected_components_over_time(ax=ax_components)
+            self.plot_edge_growth(ax=ax_edge_growth, fontsize=fontsize)
+            self.plot_node_recruitment(ax=ax_node_recruit, fontsize=fontsize)
+            self.plot_node_type_breakdown(ax=ax_node_types, fontsize=fontsize)
+            self.plot_edge_type_breakdown(ax=ax_edge_types, fontsize=fontsize)
+            self.plot_degree_distribution(ax=ax_degree, fontsize=fontsize)
+            self.plot_in_vs_out_degree(ax=ax_in_out, fontsize=fontsize)
+            self.plot_cellular_location(top_n=10, ax=ax_location, fontsize=fontsize)
+            self.plot_catalyst_reuse(ax=ax_catalyst, fontsize=fontsize)
+            self.plot_reaction_size_distribution(ax=ax_rxn_size, fontsize=fontsize)
+            self.plot_connected_components_over_time(ax=ax_components, fontsize=fontsize)
 
-            # label all panels a–j
+            # Panel labels a–j
             for ax, label in zip(
                 [
-                    ax_edge_growth,
-                    ax_node_recruit,
-                    ax_node_types,
-                    ax_edge_types,
-                    ax_degree,
-                    ax_in_out,
-                    ax_location,
-                    ax_catalyst,
-                    ax_rxn_size,
+                    ax_edge_growth, ax_node_recruit,
+                    ax_node_types, ax_edge_types, ax_degree,
+                    ax_in_out, ax_location,
+                    ax_catalyst, ax_rxn_size,
                     ax_components,
                 ],
                 ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"],
             ):
-                _panel_label(ax, label)
+                _panel_label(ax, label, fontsize=fontsize)
 
         return fig

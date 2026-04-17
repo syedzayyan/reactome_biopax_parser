@@ -56,6 +56,9 @@ class _NxGraphMixin:
         step = 0
         complex_first_step: dict = {}
 
+        # ------------------------------------------------------------------
+        # Pass 1: reactions that appear inside a PathwayStep
+        # ------------------------------------------------------------------
         order_items = list(self.reactionOrder.items())
         iterator = (
             tqdm(order_items, desc="Building graph", disable=not TQDM_AVAILABLE)
@@ -63,172 +66,48 @@ class _NxGraphMixin:
             else order_items
         )
 
+        stepped_reactions: set = set()
         for _, step_dets in iterator:
-            if step_dets[0][0] is None:
-                continue
-
-            step += 1
             reaction_id = step_dets[0][0]
-
+            if reaction_id is None:
+                continue
             if reaction_id not in self.reactions:
                 continue
 
-            left_entities, right_entities, reaction_type = self.reactions[reaction_id]
-            pathway_name = self.reaction_to_pathway.get(reaction_id)
-            catalysis_exists = self.catalysis_dets.get(reaction_id)
-            expanded_catalysts = self._expand_catalyst(catalysis_exists)
+            stepped_reactions.add(reaction_id)
+            step += 1
+            step = self._build_reaction_edges(
+                G,
+                reaction_id,
+                step,
+                complex_first_step,
+                reaction_partners,
+                include_complexes,
+            )
 
-            # Record first step each complex appears in
-            for entity_id in itertools.chain(left_entities, right_entities):
-                self._record_complex_step(entity_id, step, complex_first_step)
+        # ------------------------------------------------------------------
+        # Pass 2: reactions that are pathwayComponents but have no PathwayStep
+        # ------------------------------------------------------------------
+        unstep_count = 0
+        for reaction_id in self.reactions:
+            if reaction_id in stepped_reactions:
+                continue
+            step += 1
+            unstep_count += 1
+            step = self._build_reaction_edges(
+                G,
+                reaction_id,
+                step,
+                complex_first_step,
+                reaction_partners,
+                include_complexes,
+            )
 
-            # ------------------------------------------------------------------
-            # Translocation branch
-            # ------------------------------------------------------------------
-            if reaction_type == "translocation":
-                for left, right in zip(left_entities, right_entities):
-                    if left in self.physical_entity or right in self.physical_entity:
-                        continue
-
-                    left_ids = self._expand_single_entity(left)
-                    right_ids = self._expand_single_entity(right)
-
-                    right_by_name: dict = {}
-                    for rid in right_ids:
-                        name = self._get_entity_name(rid)
-                        if name:
-                            right_by_name[name] = rid
-
-                    for lid in left_ids:
-                        name = self._get_entity_name(lid)
-                        if not name or name not in right_by_name:
-                            continue
-                        rid = right_by_name[name]
-                        left_label = self._make_label_for_id(lid)
-                        right_label = self._make_label_for_id(rid)
-                        if (
-                            not left_label
-                            or not right_label
-                            or left_label == right_label
-                        ):
-                            continue
-
-                        G.add_node(left_label)
-                        G.add_node(right_label)
-                        G.add_edge(
-                            left_label,
-                            right_label,
-                            time=step,
-                            type="translocation",
-                            pathway=pathway_name,
-                        )
-                        for cat_id in expanded_catalysts:
-                            if cat_id is not None:
-                                cat_label = self._make_label_for_id(cat_id)
-                                if cat_label:
-                                    G.add_node(cat_label)
-                                    G.add_edge(
-                                        cat_label,
-                                        left_label,
-                                        time=step,
-                                        type="catalysis",
-                                        catalysis_type=catalysis_exists["controlType"],
-                                        pathway=pathway_name,
-                                    )
-            elif reaction_type == "broadcast":
-                # Left side stays collapsed — the gene locus is a single logical source.
-                # Only flatten right side to individual protein leaves.
-                flat_right = self._flatten_or_members(right_entities)
-
-                for left in left_entities:  # <-- no flattening, use as-is
-                    left_label = self._make_label_for_id(left)
-                    if not left_label:
-                        continue
-                    G.add_node(left_label)
-                    for right in flat_right:
-                        right_label = self._make_label_for_id(right)
-                        if not right_label:
-                            continue
-                        G.add_node(right_label)
-                        G.add_edge(
-                            left_label,
-                            right_label,
-                            time=step,
-                            type="expression",
-                            pathway=pathway_name,
-                        )
-
-            # ------------------------------------------------------------------
-            # Normal reaction branch
-            # ------------------------------------------------------------------
-            else:
-                if not include_complexes:
-                    left_entities = self._flatten_to_leaves(left_entities)
-                    right_entities = self._flatten_to_leaves(right_entities)
-
-                expanded_left = self._expand_members(left_entities)
-                expanded_right = self._expand_members(right_entities)
-
-                for cat_id in expanded_catalysts:
-                    cat_label = self._make_label_for_id(cat_id) if cat_id else None
-
-                    for left_combo in expanded_left:
-                        for right_combo in expanded_right:
-                            if cat_label is not None:
-                                G.add_node(cat_label)
-
-                            for left in left_combo:
-                                left_label = self._make_label_for_id(left)
-                                if not left_label:
-                                    continue
-                                G.add_node(left_label)
-
-                                if cat_label is not None:
-                                    G.add_edge(
-                                        cat_label,
-                                        left_label,
-                                        time=step,
-                                        type="catalysis",
-                                        catalysis_type=catalysis_exists["controlType"],
-                                        pathway=pathway_name,
-                                    )
-
-                                for right in right_combo:
-                                    right_label = self._make_label_for_id(right)
-                                    if not right_label:
-                                        continue
-                                    G.add_node(right_label)
-                                    G.add_edge(
-                                        left_label,
-                                        right_label,
-                                        time=step,
-                                        type="reaction",
-                                        pathway=pathway_name,
-                                    )
-
-                        if reaction_partners:
-                            for i, l1 in enumerate(left_combo):
-                                l1_label = self._make_label_for_id(l1)
-                                if not l1_label:
-                                    continue
-                                for l2 in left_combo[i + 1 :]:
-                                    l2_label = self._make_label_for_id(l2)
-                                    if not l2_label:
-                                        continue
-                                    G.add_edge(
-                                        l1_label,
-                                        l2_label,
-                                        time=step,
-                                        type="reaction_partner",
-                                        pathway=pathway_name,
-                                    )
-                                    G.add_edge(
-                                        l2_label,
-                                        l1_label,
-                                        time=step,
-                                        type="reaction_partner",
-                                        pathway=pathway_name,
-                                    )
+        if unstep_count:
+            self._log(
+                "debug",
+                f"Pass-2 fallback: added {unstep_count} reactions not covered by any PathwayStep",
+            )
 
         self._log(
             "info",
@@ -256,6 +135,183 @@ class _NxGraphMixin:
         self._debug_cfs = complex_first_step
         return self.finalize_graph(G)
 
+    # -------------------------------------------------------------------------
+    # Per-reaction edge builder  ← extracted helper
+    # -------------------------------------------------------------------------
+
+    def _build_reaction_edges(
+        self,
+        G: nx.DiGraph,
+        reaction_id: str,
+        step: int,
+        complex_first_step: dict,
+        reaction_partners: bool,
+        include_complexes: bool,
+    ) -> int:
+        """Build all edges for a single reaction into G.
+
+        Handles translocation, broadcast, and normal reaction types.
+        Updates complex_first_step in place.
+
+        Returns the (unchanged) step value so callers can chain cleanly.
+        """
+        left_entities, right_entities, reaction_type = self.reactions[reaction_id]
+        pathway_name = self.reaction_to_pathway.get(reaction_id)
+        catalysis_exists = self.catalysis_dets.get(reaction_id)
+        expanded_catalysts = self._expand_catalyst(catalysis_exists)
+
+        # Record first step each complex appears in
+        for entity_id in itertools.chain(left_entities, right_entities):
+            self._record_complex_step(entity_id, step, complex_first_step)
+
+        # ------------------------------------------------------------------
+        # Translocation branch
+        # ------------------------------------------------------------------
+        if reaction_type == "translocation":
+            for left, right in zip(left_entities, right_entities):
+                if left in self.physical_entity or right in self.physical_entity:
+                    continue
+
+                left_ids = self._expand_single_entity(left)
+                right_ids = self._expand_single_entity(right)
+
+                right_by_name: dict = {}
+                for rid in right_ids:
+                    name = self._get_entity_name(rid)
+                    if name:
+                        right_by_name[name] = rid
+
+                for lid in left_ids:
+                    name = self._get_entity_name(lid)
+                    if not name or name not in right_by_name:
+                        continue
+                    rid = right_by_name[name]
+                    left_label = self._make_label_for_id(lid)
+                    right_label = self._make_label_for_id(rid)
+                    if not left_label or not right_label or left_label == right_label:
+                        continue
+
+                    G.add_node(left_label)
+                    G.add_node(right_label)
+                    G.add_edge(
+                        left_label,
+                        right_label,
+                        time=step,
+                        type="translocation",
+                        pathway=pathway_name,
+                    )
+                    for cat_id in expanded_catalysts:
+                        if cat_id is not None:
+                            cat_label = self._make_label_for_id(cat_id)
+                            if cat_label:
+                                G.add_node(cat_label)
+                                G.add_edge(
+                                    cat_label,
+                                    left_label,
+                                    time=step,
+                                    type="catalysis",
+                                    catalysis_type=catalysis_exists["controlType"],
+                                    pathway=pathway_name,
+                                )
+
+        # ------------------------------------------------------------------
+        # Broadcast branch
+        # ------------------------------------------------------------------
+        elif reaction_type == "broadcast":
+            flat_right = self._flatten_or_members(right_entities)
+
+            for left in left_entities:
+                left_label = self._make_label_for_id(left)
+                if not left_label:
+                    continue
+                G.add_node(left_label)
+                for right in flat_right:
+                    right_label = self._make_label_for_id(right)
+                    if not right_label:
+                        continue
+                    G.add_node(right_label)
+                    G.add_edge(
+                        left_label,
+                        right_label,
+                        time=step,
+                        type="expression",
+                        pathway=pathway_name,
+                    )
+
+        # ------------------------------------------------------------------
+        # Normal reaction branch
+        # ------------------------------------------------------------------
+        else:
+            if not include_complexes:
+                left_entities = self._flatten_to_leaves(left_entities)
+                right_entities = self._flatten_to_leaves(right_entities)
+
+            expanded_left = self._expand_members(left_entities)
+            expanded_right = self._expand_members(right_entities)
+
+            for cat_id in expanded_catalysts:
+                cat_label = self._make_label_for_id(cat_id) if cat_id else None
+
+                for left_combo in expanded_left:
+                    for right_combo in expanded_right:
+                        if cat_label is not None:
+                            G.add_node(cat_label)
+
+                        for left in left_combo:
+                            left_label = self._make_label_for_id(left)
+                            if not left_label:
+                                continue
+                            G.add_node(left_label)
+
+                            if cat_label is not None:
+                                G.add_edge(
+                                    cat_label,
+                                    left_label,
+                                    time=step,
+                                    type="catalysis",
+                                    catalysis_type=catalysis_exists["controlType"],
+                                    pathway=pathway_name,
+                                )
+
+                            for right in right_combo:
+                                right_label = self._make_label_for_id(right)
+                                if not right_label:
+                                    continue
+                                G.add_node(right_label)
+                                G.add_edge(
+                                    left_label,
+                                    right_label,
+                                    time=step,
+                                    type="reaction",
+                                    pathway=pathway_name,
+                                )
+
+                        if reaction_partners:
+                            for i, l1 in enumerate(left_combo):
+                                l1_label = self._make_label_for_id(l1)
+                                if not l1_label:
+                                    continue
+                                for l2 in left_combo[i + 1 :]:
+                                    l2_label = self._make_label_for_id(l2)
+                                    if not l2_label:
+                                        continue
+                                    G.add_edge(
+                                        l1_label,
+                                        l2_label,
+                                        time=step,
+                                        type="reaction_partner",
+                                        pathway=pathway_name,
+                                    )
+                                    G.add_edge(
+                                        l2_label,
+                                        l1_label,
+                                        time=step,
+                                        type="reaction_partner",
+                                        pathway=pathway_name,
+                                    )
+
+        return step
+
     def finalize_graph(self, G, verbose=False):
         """
         Post-construction cleanup:
@@ -265,7 +321,6 @@ class _NxGraphMixin:
         orphans = [n for n in G.nodes if G.degree(n) == 0]
 
         if verbose:
-            # Categorise before pruning
             or_orphans = [n for n in orphans if str(n).startswith("[OR]")]
             leaf_orphans = [n for n in orphans if not str(n).startswith("[OR]")]
             print(f"Pruning {len(orphans)} degree-0 nodes:")
@@ -283,7 +338,6 @@ class _NxGraphMixin:
             print(f"  Nodes: {G.number_of_nodes()}")
             print(f"  Edges: {G.number_of_edges()}")
 
-            # Edge type breakdown
             from collections import Counter
 
             edge_types = Counter(
@@ -293,7 +347,6 @@ class _NxGraphMixin:
             for etype, count in edge_types.most_common():
                 print(f"    {etype}: {count}")
 
-            # Node type breakdown
             node_types = Counter(
                 d.get("type", "unknown") for _, d in G.nodes(data=True)
             )
@@ -324,11 +377,9 @@ class _NxGraphMixin:
 
             for component_id in cdata["components"]:
                 if component_id in self.complexes:
-                    # Sub-complex: recurse first, then wire
                     sub_cdata = self.complexes[component_id]
                     sub_label = self._make_label(sub_cdata["name"], sub_cdata)
 
-                    # ---- OR-aware: if sub-complex is an OR-group, expand leaves ----
                     sub_members = sub_cdata.get("members", [])
                     if sub_members:
                         for leaf_id, leaf_label in self._resolve_or_leaves(
@@ -356,7 +407,6 @@ class _NxGraphMixin:
                                     time=step,
                                 )
                     else:
-                        # Normal sub-complex: wire it and recurse
                         if sub_label not in G.nodes:
                             G.add_node(sub_label)
                             G.nodes[sub_label].update(type="complex", **sub_cdata)
@@ -370,7 +420,6 @@ class _NxGraphMixin:
                         wire(component_id, step)
 
                 else:
-                    # Leaf component: check if it's an OR-group in other stores
                     leaf_pairs = self._resolve_or_leaves(component_id)
 
                     for leaf_id, leaf_label in leaf_pairs:
@@ -515,11 +564,6 @@ class _NxGraphMixin:
             return None, None
 
         def _resolve_leaves(eid, visiting=frozenset()):
-            """
-            Return list of (leaf_id, leaf_data, leaf_type) by recursively
-            expanding any entity that has `members`. Non-OR entities are
-            returned directly. Cycle-safe via immutable visiting set.
-            """
             if eid in visiting:
                 return []
             edata, etype = _get_entry(eid)
@@ -527,8 +571,7 @@ class _NxGraphMixin:
                 return []
             members = edata.get("members", [])
             if not members:
-                return [(eid, edata, etype)]  # leaf — return as-is
-            # OR-group — recurse, passing visiting | {eid} (immutable, no bleed)
+                return [(eid, edata, etype)]
             leaves = []
             for mid in members:
                 leaves.extend(_resolve_leaves(mid, visiting | {eid}))
@@ -538,23 +581,17 @@ class _NxGraphMixin:
             for entityid, entitydata in store.items():
                 members = entitydata.get("members", [])
                 if not members:
-                    continue  # not an OR-group, skip
+                    continue
 
                 parent_label = self._make_label(entitydata["name"], entitydata)
-
-                # Resolve all leaves recursively — handles any nesting depth
                 leaf_entities = _resolve_leaves(entityid)
 
-                # Seed every leaf node into G unconditionally
-                # (even if parent was never in G — makes them available
-                #  for buildComplexHierarchy and future OR-parent migrations)
                 for leaf_id, leaf_data, leaf_type in leaf_entities:
                     leaf_label = self._make_label(leaf_data["name"], leaf_data)
                     if leaf_label not in G.nodes:
                         G.add_node(leaf_label)
                         G.nodes[leaf_label].update(type=leaf_type, **leaf_data)
 
-                # Migrate edges only if parent was in G
                 if parent_label not in G.nodes:
                     continue
 
@@ -574,8 +611,6 @@ class _NxGraphMixin:
 
                 G.remove_node(parent_label)
 
-        # Sweep any [OR] nodes that buildComplexHierarchy may have re-introduced
-        # as intermediate complex components pointing to OR-parents
         or_survivors = [
             n
             for n in G.nodes
@@ -606,8 +641,6 @@ class _NxGraphMixin:
             for entity_id, entity_data in store.items():
                 label = self._make_label(entity_data["name"], entity_data)
                 if entity_data.get("members"):
-                    # Preserved OR-group (e.g. gene locus with expression edges):
-                    # annotate as the parent store's type rather than skipping.
                     if label in G.nodes and any(
                         d.get("type") == "expression"
                         for _, _, d in G.out_edges(label, data=True)

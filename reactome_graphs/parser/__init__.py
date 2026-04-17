@@ -14,6 +14,7 @@ Usage
     H = r.parse_biopax_into_hypergraph("pathway.owl")
 """
 
+from .disease_parsing import DiseaseOverlay
 from .hyper_graph import _HypergraphMixin
 from .nx_graph import _NxGraphMixin
 from .xml_parse import _ParserBase
@@ -35,4 +36,4 @@ class ReactomeBioPAX(_NxGraphMixin, _HypergraphMixin, _ParserBase):
     # MRO: ReactomeBioPAX -> _NxGraphMixin -> _HypergraphMixin -> _ParserBase
 
 
-__all__ = ["ReactomeBioPAX"]
+__all__ = ["ReactomeBioPAX", "DiseaseOverlay"]

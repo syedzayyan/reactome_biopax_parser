@@ -99,15 +99,77 @@ class _ParserBase:
         self._log("info", "BioPAX file parsing complete")
 
     def __parse_pathway_memberships(self):
-        """Map each reaction ID to its parent pathway name."""
-        self.reaction_to_pathway = {}
+        """Map each reaction ID to its most-specific (deepest) parent pathway name.
+
+        In Reactome BioPAX files a large pathway like 'Signalling by GPCR'
+        contains many sub-pathways ('GPER1 signaling', 'Beta2 adrenergic', …),
+        each owning a distinct set of reactions.  A reaction that is a direct
+        component of a sub-pathway should carry *that* sub-pathway name on its
+        edges, not the root name — otherwise every edge in the whole GPCR
+        super-pathway collapses into a single label.
+
+        Strategy
+        --------
+        1. Collect every pathway's display name and direct component list.
+        2. Compute each pathway's depth (distance from a root pathway).
+        3. For each reaction, among all pathways that claim it as a direct
+           component, pick the one with the greatest depth — i.e. the most
+           specific enclosing context.  Ties are broken arbitrarily (both
+           pathways are at equal specificity).
+        """
+        # --- pass 1: collect names, direct component lists, parent sets ---
+        pathway_names: dict[str, str] = {}  # pid -> display name
+        id_to_components: dict[str, list] = {}  # pid -> [component ids]
+        raw_parents: dict[str, list] = {}  # component_id -> [parent pids]
+
         for pathway in self.tree.findall("biopax:Pathway", namespaces):
             pid = pathway.get(ID_RDF_STRING)
             name_el = pathway.find("biopax:displayName", namespaces)
-            pname = name_el.text.strip() if name_el is not None else pid
+            pathway_names[pid] = name_el.text.strip() if name_el is not None else pid
+            components = []
             for component in pathway.findall("biopax:pathwayComponent", namespaces):
                 cid = component.get(RESOUCE_RDF_STRING, "").strip("#")
-                self.reaction_to_pathway[cid] = pname
+                components.append(cid)
+                raw_parents.setdefault(cid, []).append(pid)
+            id_to_components[pid] = components
+
+        all_pathway_ids = set(pathway_names)
+
+        # --- pass 2: compute depth of each pathway (memoised) ---
+        depth_memo: dict[str, int] = {}
+
+        def _depth(pid: str) -> int:
+            if pid in depth_memo:
+                return depth_memo[pid]
+            pathway_parents = [
+                p for p in raw_parents.get(pid, []) if p in all_pathway_ids
+            ]
+            d = (
+                0
+                if not pathway_parents
+                else 1 + max(_depth(p) for p in pathway_parents)
+            )
+            depth_memo[pid] = d
+            return d
+
+        for pid in all_pathway_ids:
+            _depth(pid)
+
+        # --- pass 3: assign each reaction to its deepest (most specific) parent ---
+        self.reaction_to_pathway = {}
+        for reaction_id in self.reactions:
+            parents = [
+                p for p in raw_parents.get(reaction_id, []) if p in all_pathway_ids
+            ]
+            if not parents:
+                continue
+            deepest = max(parents, key=_depth)
+            self.reaction_to_pathway[reaction_id] = pathway_names[deepest]
+
+        self._log(
+            "debug",
+            f"Mapped {len(self.reaction_to_pathway)} reactions to their most-specific pathway",
+        )
 
     def __parse_entity_refs(self, biopax_type: str) -> dict:
         refs = {}

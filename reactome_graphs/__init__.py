@@ -1,5 +1,5 @@
 from .featurise import NodeFeaturiser
-from .parser import ReactomeBioPAX
+from .parser import DiseaseOverlay, ReactomeBioPAX
 from .utils import (
     download_biopax_files_by_org,
     download_list_of_pathways,
@@ -11,6 +11,7 @@ from .visualisations import ReactomeViz
 
 __all__ = [
     "ReactomeBioPAX",
+    "DiseaseOverlay",
     "ReactomeViz",
     "NodeFeaturiser",
     "download_list_of_pathways",
