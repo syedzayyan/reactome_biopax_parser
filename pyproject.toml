@@ -10,7 +10,19 @@ dependencies = [
     "networkx",
     "requests",
     "pandas",
-    "tqdm"
+    "tqdm",
+
+    # Core ML
+    "torch>=2.2",
+
+    # R bridge (optional but included here)
+    "rpy2>=3.5"
+]
+
+[project.optional-dependencies]
+# Graph ML stack (install when needed)
+gnn = [
+    "torch-geometric>=2.5"
 ]
 
 [build-system]
@@ -20,7 +32,3 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["reactome_graphs*"]
-
-
-[tool.uv.extra-build-dependencies]
-pyhawkes = ["Cython"]

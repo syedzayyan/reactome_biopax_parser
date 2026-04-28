@@ -87,14 +87,13 @@ class _ParserBase:
 
         self._log("debug", "Parsing reactions...")
         self.__parse_reactions()
+        self.__parse_pathway_memberships()
 
         self._log("debug", "Parsing reaction order...")
         self.__parse_reaction_order()
 
         self._log("debug", "Parsing stoichiometry...")
         self.__parse_stoichometry()
-
-        self.__parse_pathway_memberships()
 
         self._log("info", "BioPAX file parsing complete")
 
@@ -121,9 +120,17 @@ class _ParserBase:
         pathway_names: dict[str, str] = {}  # pid -> display name
         id_to_components: dict[str, list] = {}  # pid -> [component ids]
         raw_parents: dict[str, list] = {}  # component_id -> [parent pids]
+        id_to_steps: dict[str, int] = {}  # component_id -> [parent pids]
 
         for pathway in self.tree.findall("biopax:Pathway", namespaces):
+            step_ids = [
+                s.get(RESOUCE_RDF_STRING, "").strip("#")
+                for s in pathway.findall("biopax:pathwayOrder", namespaces)
+            ]
             pid = pathway.get(ID_RDF_STRING)
+
+            id_to_steps[pid] = step_ids
+
             name_el = pathway.find("biopax:displayName", namespaces)
             pathway_names[pid] = name_el.text.strip() if name_el is not None else pid
             components = []
@@ -165,6 +172,12 @@ class _ParserBase:
                 continue
             deepest = max(parents, key=_depth)
             self.reaction_to_pathway[reaction_id] = pathway_names[deepest]
+
+        self.pathway_to_steps = id_to_steps  # pid -> [stepID, ...]
+        self.step_to_pathway = {
+            sid: pid for pid, sids in id_to_steps.items() for sid in sids
+        }
+        self.pathway_names = pathway_names  # expose for downstream use
 
         self._log(
             "debug",
@@ -591,20 +604,17 @@ class _ParserBase:
 
     def __parse_reaction_order(self):
         r"""Parse the order of biochemical pathway steps.
-
         Extracts relationships between pathway steps, including
         which biochemical reactions occur and which steps follow.
         """
         steps_list = list(self.tree.findall("biopax:PathwayStep", namespaces))
         self._log("debug", f"Found {len(steps_list)} pathway steps")
-
         reaction_steps = {}
         iterator = (
             tqdm(steps_list, desc="Parsing pathway steps", disable=not TQDM_AVAILABLE)
             if TQDM_AVAILABLE
             else steps_list
         )
-
         for pathways in iterator:
             stepID = pathways.get("{%s}ID" % namespaces["rdf"])
             stepDetails = [None, []]
@@ -614,15 +624,61 @@ class _ParserBase:
                     stepDetails[0] = stepText
                 else:
                     stepDetails[1].append(stepText)
-
             nextStep = [
                 steps.get(RESOUCE_RDF_STRING, None).strip("#")
                 for steps in pathways.findall("biopax:nextStep", namespaces)
             ]
             reaction_steps[stepID] = (stepDetails, nextStep)
-        self.reactionOrder = reaction_steps
+        # ← parse loop ends here
 
+        self.reactionOrder = reaction_steps
         self._log("info", f"Parsed {len(self.reactionOrder)} pathway steps")
+
+        # ---- per-pathway traversal: assign (pathway_id, local_order) to each step ----
+        from collections import deque
+
+        self.step_order = {}  # stepID -> (pathway_id, local_index)
+
+        for pid, step_ids in self.pathway_to_steps.items():
+            step_set = set(step_ids)
+            if not step_set:
+                continue
+
+            # Find roots: steps in this pathway that no other step in this pathway
+            # points to via nextStep.
+            incoming = set()
+            for sid in step_ids:
+                if sid not in self.reactionOrder:
+                    continue
+                _, next_steps = self.reactionOrder[sid]
+                for ns in next_steps:
+                    if ns in step_set:
+                        incoming.add(ns)
+            roots = [s for s in step_ids if s not in incoming]
+
+            # BFS from roots, assign local order in traversal sequence.
+            visited = set()
+            order_idx = 0
+            queue = deque(roots)
+            while queue:
+                sid = queue.popleft()
+                if sid in visited or sid not in step_set:
+                    continue
+                visited.add(sid)
+                self.step_order[sid] = (pid, order_idx)
+                order_idx += 1
+                if sid in self.reactionOrder:
+                    _, next_steps = self.reactionOrder[sid]
+                    for ns in next_steps:
+                        if ns in step_set and ns not in visited:
+                            queue.append(ns)
+
+            # Cycle safety: steps in cycles with no roots won't be reached by BFS.
+            for sid in step_ids:
+                if sid in step_set and sid not in visited:
+                    visited.add(sid)
+                    self.step_order[sid] = (pid, order_idx)
+                    order_idx += 1
 
     def __parse_reactions(self):
         reactions_list = list(

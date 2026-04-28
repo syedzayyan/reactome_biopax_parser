@@ -28,17 +28,33 @@ class _NxGraphMixin:
         Args:
             filename (str): Path to the BioPAX Level 3 file.
             reaction_partners (bool): If True, add bidirectional edges between
-                all left-side co-reactants in each reaction.
+                all left-side co-reactants (left_reactant) and all right-side
+                co-products (right_product) in each reaction.  OR-group nodes
+                participate in these edges like any other entity; the only
+                excluded pairs are an OR node and its own direct members,
+                because those members are alternatives for the OR node itself,
+                not independent co-participants.
             include_complexes (bool): If True (default), complex entities are
                 added as nodes with complex_component edges to their members.
                 If False, complexes are not added as nodes — instead,
-                bidirectional co-membership edges are added between all
+                bidirectional co-membership edges are added between all leaf
                 participants of each complex, and reaction edges reference
-                participant proteins directly.
+                leaf proteins directly.
             logger (logging.Logger, optional): Logger instance.
 
         Returns:
             networkx.DiGraph: Directed graph of biochemical interactions.
+
+        Edge types
+        ----------
+        reaction          left entity → right entity          directed
+        catalysis         catalyst → left entity              directed
+        left_reactant     left ↔ left co-reactant             bidirectional
+        right_product     right ↔ right co-product            bidirectional
+        translocation     left location → right location      directed
+        expression        DNA/gene → each protein product     directed
+        complex_component member → complex (or member ↔ member when
+                          include_complexes=False)             directed / bidir
         """
         if logger is not None:
             self.logger = logger
@@ -53,37 +69,45 @@ class _NxGraphMixin:
         self._member_cache = {}
 
         G = nx.DiGraph()
-        step = 0
         complex_first_step: dict = {}
 
         # ------------------------------------------------------------------
         # Pass 1: reactions that appear inside a PathwayStep
         # ------------------------------------------------------------------
-        order_items = list(self.reactionOrder.items())
+        # Sort by (pathway_id, local_order) so traversal within a pathway is
+        # meaningful; ordering across sibling pathways is arbitrary but
+        # deterministic. global_rank gives every edge a monotonic int for
+        # time-series plots.
+        order_items = sorted(
+            self.reactionOrder.items(),
+            key=lambda kv: self.step_order.get(kv[0], ("~", 10**9)),
+            # "~" sorts after real pathway IDs; unclaimed steps land at the end
+        )
         iterator = (
             tqdm(order_items, desc="Building graph", disable=not TQDM_AVAILABLE)
             if TQDM_AVAILABLE
             else order_items
         )
 
+        global_rank = 0
         stepped_reactions: set = set()
-        for _, step_dets in iterator:
+        for step_id, step_dets in iterator:
             reaction_id = step_dets[0][0]
-            if reaction_id is None:
+            if reaction_id is None or reaction_id not in self.reactions:
                 continue
-            if reaction_id not in self.reactions:
-                continue
-
             stepped_reactions.add(reaction_id)
-            step += 1
-            step = self._build_reaction_edges(
+
+            step_key = self.step_order.get(step_id, (None, None))
+            self._build_reaction_edges(
                 G,
                 reaction_id,
-                step,
+                step_key,
+                global_rank,
                 complex_first_step,
                 reaction_partners,
                 include_complexes,
             )
+            global_rank += 1
 
         # ------------------------------------------------------------------
         # Pass 2: reactions that are pathwayComponents but have no PathwayStep
@@ -92,16 +116,17 @@ class _NxGraphMixin:
         for reaction_id in self.reactions:
             if reaction_id in stepped_reactions:
                 continue
-            step += 1
-            unstep_count += 1
-            step = self._build_reaction_edges(
+            self._build_reaction_edges(
                 G,
                 reaction_id,
-                step,
+                (None, None),  # no pathway / no local_order
+                global_rank,
                 complex_first_step,
                 reaction_partners,
                 include_complexes,
             )
+            global_rank += 1
+            unstep_count += 1
 
         if unstep_count:
             self._log(
@@ -112,7 +137,8 @@ class _NxGraphMixin:
         self._log(
             "info",
             f"Reaction graph built: {G.number_of_nodes()} nodes, "
-            f"{G.number_of_edges()} edges over {step} steps",
+            f"{G.number_of_edges()} edges across {global_rank} reactions "
+            f"({len(stepped_reactions)} stepped, {unstep_count} unstepped)",
         )
 
         if include_complexes:
@@ -136,33 +162,31 @@ class _NxGraphMixin:
         return self.finalize_graph(G)
 
     # -------------------------------------------------------------------------
-    # Per-reaction edge builder  ← extracted helper
+    # Per-reaction edge builder
     # -------------------------------------------------------------------------
 
     def _build_reaction_edges(
         self,
         G: nx.DiGraph,
         reaction_id: str,
-        step: int,
+        step_key: tuple,  # (pathway_id, local_order) — or (None, None)
+        global_rank: int,  # monotonic int across all edges for time-series plots
         complex_first_step: dict,
         reaction_partners: bool,
         include_complexes: bool,
-    ) -> int:
-        """Build all edges for a single reaction into G.
-
-        Handles translocation, broadcast, and normal reaction types.
-        Updates complex_first_step in place.
-
-        Returns the (unchanged) step value so callers can chain cleanly.
-        """
+    ) -> None:
+        """..."""
         left_entities, right_entities, reaction_type = self.reactions[reaction_id]
         pathway_name = self.reaction_to_pathway.get(reaction_id)
         catalysis_exists = self.catalysis_dets.get(reaction_id)
         expanded_catalysts = self._expand_catalyst(catalysis_exists)
 
+        # Unpack once; every edge below uses these three.
+        step_pathway, local_order = step_key if step_key else (None, None)
+
         # Record first step each complex appears in
         for entity_id in itertools.chain(left_entities, right_entities):
-            self._record_complex_step(entity_id, step, complex_first_step)
+            self._record_complex_step(entity_id, global_rank, complex_first_step)
 
         # ------------------------------------------------------------------
         # Translocation branch
@@ -196,9 +220,10 @@ class _NxGraphMixin:
                     G.add_edge(
                         left_label,
                         right_label,
-                        time=step,
-                        type="translocation",
+                        time=global_rank,
+                        local_order=local_order,
                         pathway=pathway_name,
+                        type="translocation",
                     )
                     for cat_id in expanded_catalysts:
                         if cat_id is not None:
@@ -208,8 +233,9 @@ class _NxGraphMixin:
                                 G.add_edge(
                                     cat_label,
                                     left_label,
-                                    time=step,
+                                    time=global_rank,
                                     type="catalysis",
+                                    local_order=local_order,
                                     catalysis_type=catalysis_exists["controlType"],
                                     pathway=pathway_name,
                                 )
@@ -233,7 +259,8 @@ class _NxGraphMixin:
                     G.add_edge(
                         left_label,
                         right_label,
-                        time=step,
+                        time=global_rank,
+                        local_order=local_order,
                         type="expression",
                         pathway=pathway_name,
                     )
@@ -243,74 +270,129 @@ class _NxGraphMixin:
         # ------------------------------------------------------------------
         else:
             if not include_complexes:
+                # Flatten complexes to their leaf members so the graph never
+                # contains complex nodes.  This is a flat union — no cartesian
+                # product.  NX deduplicates edges natively so any repeated
+                # (src, dst) pair from shared sub-complexes is harmless.
                 left_entities = self._flatten_to_leaves(left_entities)
                 right_entities = self._flatten_to_leaves(right_entities)
 
-            expanded_left = self._expand_members(left_entities)
-            expanded_right = self._expand_members(right_entities)
+            # Resolve labels for both sides up front.
+            # We store (label, entity_id) so we can check OR membership later.
+            left_resolved: list[tuple[str, str]] = []
+            for eid in left_entities:
+                lbl = self._make_label_for_id(eid)
+                if lbl:
+                    G.add_node(lbl)
+                    left_resolved.append((lbl, eid))
 
+            right_resolved: list[tuple[str, str]] = []
+            for eid in right_entities:
+                lbl = self._make_label_for_id(eid)
+                if lbl:
+                    G.add_node(lbl)
+                    right_resolved.append((lbl, eid))
+
+            # Catalysis nodes
             for cat_id in expanded_catalysts:
                 cat_label = self._make_label_for_id(cat_id) if cat_id else None
+                if cat_label:
+                    G.add_node(cat_label)
 
-                for left_combo in expanded_left:
-                    for right_combo in expanded_right:
-                        if cat_label is not None:
-                            G.add_node(cat_label)
+                # Reaction edges: left → right  (flat O(L×R), no cartesian)
+                for left_label, _ in left_resolved:
+                    if cat_label is not None:
+                        G.add_edge(
+                            cat_label,
+                            left_label,
+                            time=global_rank,
+                            local_order=local_order,
+                            type="catalysis",
+                            catalysis_type=catalysis_exists["controlType"],
+                            pathway=pathway_name,
+                        )
+                    for right_label, _ in right_resolved:
+                        G.add_edge(
+                            left_label,
+                            right_label,
+                            time=global_rank,
+                            local_order=local_order,
+                            type="reaction",
+                            pathway=pathway_name,
+                        )
 
-                        for left in left_combo:
-                            left_label = self._make_label_for_id(left)
-                            if not left_label:
-                                continue
-                            G.add_node(left_label)
+            # ------------------------------------------------------------------
+            # Reaction-partner edges
+            # ------------------------------------------------------------------
+            # left_reactant  : bidirectional between every pair of left-side
+            #                  participants, including OR-group nodes.
+            # right_product  : bidirectional between every pair of right-side
+            #                  participants, including OR-group nodes.
+            #
+            # The only excluded pairs are (OR node, one of its own direct
+            # members), because a member is an *alternative* for its OR parent,
+            # not an independent co-participant alongside it.  Every other
+            # combination — including OR node ↔ regular node, and OR node ↔
+            # different OR node — gets partner edges normally.
+            if reaction_partners:
+                # Build the forbidden set: {frozenset({or_label, member_label})}
+                or_member_pairs: set[frozenset] = set()
+                all_resolved = left_resolved + right_resolved
+                for lbl, eid in all_resolved:
+                    direct_members = self._get_direct_members(eid)
+                    for mid in direct_members:
+                        m_label = self._make_label_for_id(mid)
+                        if m_label:
+                            or_member_pairs.add(frozenset({lbl, m_label}))
 
-                            if cat_label is not None:
-                                G.add_edge(
-                                    cat_label,
-                                    left_label,
-                                    time=step,
-                                    type="catalysis",
-                                    catalysis_type=catalysis_exists["controlType"],
-                                    pathway=pathway_name,
-                                )
+                left_labels = [lbl for lbl, _ in left_resolved]
+                right_labels = [lbl for lbl, _ in right_resolved]
 
-                            for right in right_combo:
-                                right_label = self._make_label_for_id(right)
-                                if not right_label:
-                                    continue
-                                G.add_node(right_label)
-                                G.add_edge(
-                                    left_label,
-                                    right_label,
-                                    time=step,
-                                    type="reaction",
-                                    pathway=pathway_name,
-                                )
+                for i, l1 in enumerate(left_labels):
+                    for l2 in left_labels[i + 1 :]:
+                        if frozenset({l1, l2}) in or_member_pairs:
+                            continue
+                        G.add_edge(
+                            l1,
+                            l2,
+                            time=global_rank,
+                            local_order=local_order,
+                            type="left_reactant",
+                            pathway=pathway_name,
+                        )
+                        G.add_edge(
+                            l2,
+                            l1,
+                            time=global_rank,
+                            local_order=local_order,
+                            type="left_reactant",
+                            pathway=pathway_name,
+                        )
 
-                        if reaction_partners:
-                            for i, l1 in enumerate(left_combo):
-                                l1_label = self._make_label_for_id(l1)
-                                if not l1_label:
-                                    continue
-                                for l2 in left_combo[i + 1 :]:
-                                    l2_label = self._make_label_for_id(l2)
-                                    if not l2_label:
-                                        continue
-                                    G.add_edge(
-                                        l1_label,
-                                        l2_label,
-                                        time=step,
-                                        type="reaction_partner",
-                                        pathway=pathway_name,
-                                    )
-                                    G.add_edge(
-                                        l2_label,
-                                        l1_label,
-                                        time=step,
-                                        type="reaction_partner",
-                                        pathway=pathway_name,
-                                    )
+                for i, r1 in enumerate(right_labels):
+                    for r2 in right_labels[i + 1 :]:
+                        if frozenset({r1, r2}) in or_member_pairs:
+                            continue
+                        G.add_edge(
+                            r1,
+                            r2,
+                            time=global_rank,
+                            local_order=local_order,
+                            type="right_product",
+                            pathway=pathway_name,
+                        )
+                        G.add_edge(
+                            r2,
+                            r1,
+                            time=global_rank,
+                            local_order=local_order,
+                            type="right_product",
+                            pathway=pathway_name,
+                        )
 
-        return step
+    # -------------------------------------------------------------------------
+    # Post-construction cleanup
+    # -------------------------------------------------------------------------
 
     def finalize_graph(self, G, verbose=False):
         """
@@ -491,8 +573,15 @@ class _NxGraphMixin:
         """Add bidirectional co-membership edges between all leaf participants
         of each complex, without adding the complex itself as a node.
 
-        Only complexes reachable from reaction-participating complexes are processed.
-        Leaf resolution is cached so shared sub-complexes are only traversed once.
+        Only complexes reachable from reaction-participating complexes are
+        processed.  Leaf resolution is cached so shared sub-complexes are
+        only traversed once.
+
+        Performance note: leaf_cache eliminates redundant traversals of shared
+        sub-complexes, which is the main source of slowness when
+        include_complexes=False.  The inner loop is O(leaves²) per complex but
+        leaves are proteins/molecules (already in G), so the set is small in
+        practice and NX deduplicates any repeated edges for free.
         """
         leaf_cache: dict = {}
 
@@ -507,7 +596,12 @@ class _NxGraphMixin:
                 if component_id in self.complexes:
                     leaves.extend(_get_leaves(component_id, visiting))
                 else:
-                    leaves.append(component_id)
+                    # OR-group non-complex component: expand to its leaves
+                    resolved = self._resolve_or_leaves(component_id)
+                    if resolved:
+                        leaves.extend(lid for lid, _ in resolved)
+                    else:
+                        leaves.append(component_id)
             leaf_cache[cid] = leaves
             return leaves
 
@@ -519,6 +613,9 @@ class _NxGraphMixin:
             step = complex_first_step[label]
             leaves = _get_leaves(cid, frozenset())
 
+            # Deduplicate and keep only nodes already in G (i.e. reaction
+            # participants).  Silently drop leaves that never appeared in any
+            # reaction — they have no pathway context and would become orphans.
             seen: set = set()
             leaf_labels: list = []
             for lid in leaves:
@@ -550,7 +647,7 @@ class _NxGraphMixin:
         """
         all_stores = [
             (self.proteins, "protein"),
-            (self.molecules, "molecule"),
+            (self.molecules, "small_molecule"),  # was "molecule"
             (self.dna, "dna"),
             (self.rna, "rna"),
             (self.physical_entity, "physical_entity"),
@@ -697,23 +794,7 @@ class _NxGraphMixin:
         self._member_cache[entity_id] = result
         return result
 
-    def _expand_members(self, entity_list: list) -> list:
-        """Expand a list of entities into all combinations of member alternatives.
-
-        Returns:
-            List of lists — all possible combinations via cartesian product.
-        """
-        if not entity_list:
-            return [[]]
-        expanded_per_entity = [self._expand_single_entity(eid) for eid in entity_list]
-        return [list(combo) for combo in itertools.product(*expanded_per_entity)]
-
     def _flatten_to_leaves(self, entity_list: list) -> list:
-        """Flatten entity IDs, expanding complexes recursively to leaf members.
-
-        Used when include_complexes=False. Results per entity are cached.
-        Uses an iterative stack to avoid recursion limits on deep hierarchies.
-        """
         if not hasattr(self, "_leaf_cache"):
             self._leaf_cache = {}
         result = []
@@ -727,10 +808,21 @@ class _NxGraphMixin:
             while stack:
                 current = stack.pop()
                 if current in self.complexes:
-                    if current in visiting:
-                        continue
-                    visiting.add(current)
-                    stack.extend(self.complexes[current]["components"])
+                    cdata = self.complexes[current]
+                    if cdata.get("members"):
+                        # OR-group of complexes: expand through members,
+                        # not components. Each member may itself be a complex
+                        # that needs further flattening.
+                        if current in visiting:
+                            continue
+                        visiting.add(current)
+                        stack.extend(cdata["members"])
+                    else:
+                        # Structural complex: flatten to leaf components
+                        if current in visiting:
+                            continue
+                        visiting.add(current)
+                        stack.extend(cdata["components"])
                 else:
                     leaves.append(current)
             self._leaf_cache[eid] = leaves
@@ -820,26 +912,33 @@ class _NxGraphMixin:
         self._name_cache[entity_id] = name
         return name
 
-    def _record_complex_step(
-        self,
-        entity_id: str,
-        step: int,
-        registry: dict,
-        visiting: frozenset = frozenset(),
-    ):
-        """Iterative BFS registration — avoids recursion limit on deep complexes."""
-        stack = [(entity_id, frozenset())]
-        while stack:
-            cid, visited = stack.pop()
-            if cid not in self.complexes or cid in visited:
-                continue
-            label = self._make_label_for_id(cid)
-            if label and label not in registry:
-                registry[label] = step
-            visited = visited | {cid}
-            for comp_id in self.complexes[cid].get("components", []):
-                if comp_id in self.complexes and comp_id not in visited:
-                    stack.append((comp_id, visited))
+    def _get_direct_members(self, entity_id: str) -> list:
+        """Return the direct member IDs of an OR-group entity, or [] if none.
+
+        Used to build the forbidden set for reaction-partner edge generation:
+        an OR node and its own direct members should not receive partner edges
+        between them, because the members are alternatives for the OR node
+        rather than independent co-participants in the reaction.
+        """
+        for store in (
+            self.proteins,
+            self.molecules,
+            self.dna,
+            self.rna,
+            self.physical_entity,
+            self.complexes,
+        ):
+            if entity_id in store:
+                return store[entity_id].get("members", [])
+        return []
+
+    def _record_complex_step(self, entity_id, rank, registry):
+        label = self._make_label_for_id(entity_id)
+        if label is None:
+            return
+        existing = registry.get(label)
+        if existing is None or rank < existing:
+            registry[label] = rank
 
     def _flatten_or_members(self, entity_list: list) -> list:
         """Like _expand_single_entity but flattens all OR-groups to leaves,
