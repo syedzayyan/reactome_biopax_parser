@@ -1,5 +1,6 @@
 from .featurise import NodeFeaturiser
 from .parser import DiseaseOverlay, ReactomeBioPAX
+from .pathway_comp import PathwaySet, component_inventory
 from .utils import (
     download_biopax_files_by_org,
     download_list_of_pathways,
@@ -19,4 +20,6 @@ __all__ = [
     "download_biopax_files_by_org",
     "query_entities_to_json",
     "download_uniprot_json_from_accession_id",
+    "PathwaySet",
+    "component_inventory",
 ]
