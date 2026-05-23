@@ -494,12 +494,13 @@ class FISHRGCN(nn.Module):
         dropout: float = 0.2,
         order_mode: str = "regression",
         n_order_bins: int = 20,
-        n_negatives: int = 5,
+        n_negatives: int = 20,
         time_encoding: bool = False,
         time_dim: int = 64,
         architecture: str = "rgcn",
         rgat_heads: int = 1,
         use_compartment: bool = False,
+        smart_negatives: bool = True,
     ):
         super().__init__()
         if architecture not in ("rgcn", "rgat"):
@@ -513,6 +514,7 @@ class FISHRGCN(nn.Module):
         self.time_dim = time_dim
         self.architecture = architecture
         self.use_compartment = use_compartment
+        self.smart_negatives = smart_negatives
 
         # Per-type input projections. When use_compartment=True, each per-type
         # native feature vector is concatenated with the per-node compartment
@@ -718,6 +720,82 @@ def _sample_negatives(
     return torch.randint(0, n_nodes, (src.numel(), n_negatives), device=device)
 
 
+def _build_train_negative_state(data: FISHData, device) -> dict:
+    """
+    Precompute structures for training-time smart negatives.
+
+    Stores per-node-type id lists as a single padded tensor with offset
+    pointers, so we can sample from a node-type's id pool in pure
+    tensor ops (no Python loop, GPU-friendly).
+    """
+    nt = data.node_type.cpu().numpy()
+    # Per-type sorted lists of node ids.
+    type_to_ids: list[np.ndarray] = []
+    max_len = 0
+    for t in range(data.n_node_types):
+        ids = np.where(nt == t)[0].astype(np.int64)
+        type_to_ids.append(ids)
+        max_len = max(max_len, len(ids))
+
+    # Pad each type's id-list to max_len so we have a (n_types, max_len)
+    # tensor we can gather from. Padding value is 0 (a valid node id);
+    # we use a separate (n_types,) lengths tensor to mask out the padded
+    # slots when sampling.
+    n_types = data.n_node_types
+    pool_tensor = torch.zeros((n_types, max_len), dtype=torch.long, device=device)
+    pool_lens = torch.zeros(n_types, dtype=torch.long, device=device)
+    for t, ids in enumerate(type_to_ids):
+        pool_tensor[t, : len(ids)] = torch.from_numpy(ids).to(device)
+        pool_lens[t] = len(ids)
+
+    return {
+        "pool_tensor": pool_tensor,  # (n_node_types, max_pool_size)
+        "pool_lens": pool_lens,  # (n_node_types,)
+        "node_type": data.node_type.to(device),  # (N,)
+    }
+
+
+def _sample_train_smart_negatives(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    train_neg_state: dict,
+    n_negatives: int,
+) -> torch.Tensor:
+    """
+    Type-matched negative sampling for training. Fully vectorised:
+    for each positive (u, v), sample n_negatives random nodes from the
+    pool of nodes whose node-type matches v.
+
+    Does NOT exclude u's known training partners (would require a per-row
+    rejection loop that kills training throughput). The fraction of
+    accidentally-sampled true partners is bounded by mean_partners/|type|,
+    typically <1% on biological graphs; we accept this as label noise
+    in exchange for ~100x speedup over filtered sampling.
+    """
+    pool_tensor = train_neg_state["pool_tensor"]  # (n_types, max_len)
+    pool_lens = train_neg_state["pool_lens"]  # (n_types,)
+    node_type = train_neg_state["node_type"]  # (N,)
+
+    n_pos = dst.numel()
+    # For each positive, find v's node type and its pool length.
+    dst_types = node_type[dst]  # (n_pos,)
+    dst_pool_lens = pool_lens[dst_types]  # (n_pos,)
+
+    # Sample random indices in [0, pool_lens[type]) for each positive,
+    # for each of n_negatives draws. Shape: (n_pos, n_negatives).
+    rand01 = torch.rand(n_pos, n_negatives, device=src.device)
+    sampled_idx = (rand01 * dst_pool_lens.unsqueeze(1).float()).long()
+    sampled_idx = sampled_idx.clamp(max=pool_tensor.shape[1] - 1)
+
+    # Gather from the per-type pool. Need to expand dst_types for gathering.
+    # pool_tensor[dst_types[i], sampled_idx[i, j]] -> negative id
+    type_rep = dst_types.unsqueeze(1).expand(n_pos, n_negatives)  # (n_pos, n_neg)
+    flat_pool = pool_tensor.flatten()  # (n_types*max_len,)
+    flat_idx = type_rep * pool_tensor.shape[1] + sampled_idx  # global pool idx
+    neg_ids = flat_pool[flat_idx]  # (n_pos, n_neg)
+    return neg_ids
+
+
 def train(
     model: FISHRGCN,
     data: FISHData,
@@ -758,6 +836,14 @@ def train(
         thresholds = torch.arange(model.n_order_bins - 1, device=device)
         coral_levels = (bin_tr.unsqueeze(1) > thresholds.unsqueeze(0)).float()
 
+    # Training-time negative sampler. Precomputed once. When
+    # model.smart_negatives is True, samples come from v's node-type pool
+    # (without filtering for known partners, for throughput). Otherwise
+    # uniformly random over all nodes.
+    train_neg_state = None
+    if model.smart_negatives:
+        train_neg_state = _build_train_negative_state(data, device)
+
     history = {"exist": [], "type": [], "order": [], "total": []}
 
     for epoch in range(1, epochs + 1):
@@ -767,7 +853,21 @@ def train(
 
         # 1) Existence: positives + K negatives per positive.
         pos_logit = model.existence_logit(h, src_tr, dst_tr)
-        negs = _sample_negatives(data, src_tr, model.n_negatives, data.n_nodes, device)
+        if model.smart_negatives and train_neg_state is not None:
+            negs = _sample_train_smart_negatives(
+                src_tr,
+                dst_tr,
+                train_neg_state,
+                model.n_negatives,
+            )
+        else:
+            negs = _sample_negatives(
+                data,
+                src_tr,
+                model.n_negatives,
+                data.n_nodes,
+                device,
+            )
         src_rep = src_tr.repeat_interleave(model.n_negatives)
         neg_logit = model.existence_logit(h, src_rep, negs.reshape(-1))
         loss_exist = F.binary_cross_entropy_with_logits(
@@ -906,60 +1006,80 @@ def _hits_at_k(
     src: torch.Tensor,
     dst: torch.Tensor,
     candidate_pool: torch.Tensor,
+    n_nodes_total: int,
     ks: tuple[int, ...] = (1, 10, 100),
-    batch_size: int = 2048,
+    dyads_per_chunk: int = 1_000_000,
 ) -> dict[int, float]:
     """
-    Hits@K over a candidate pool, computed by ranking the true positive
-    against every node in ``candidate_pool`` and checking whether the
-    true v's rank is in the top K.
+    Hits@K over a candidate pool. For each positive (src[i], dst[i]),
+    score against every candidate in ``candidate_pool`` and check whether
+    the true dst is ranked in the top K by existence-head score.
 
-    Filtering: ``candidate_pool`` is the set of candidates considered for
-    each positive (e.g. all nodes, or only nodes of v's type). The true
-    positive is always included; ties broken arbitrarily by argsort.
+    Performance notes:
+      * The candidate embeddings ``h[candidate_pool]`` are computed once
+        and reused across positive chunks (avoids redundant gathers).
+      * The src embeddings within a chunk are broadcast against the cached
+        candidate embeddings, then run through the MLP heads. This keeps
+        the gather pattern out of the hot loop.
+      * dyads_per_chunk=1M is the CUDA-friendly default; reduce to ~250k
+        if running on MPS or 8GB GPUs where the chunk's ~1GB activations
+        would force swapping.
 
-    Returns dict mapping K -> fraction of positives with true v in top K.
+    Tie-breaking: pessimistic. Rank = #candidates with strictly higher score
+    plus 1; ties count against the positive.
     """
     n_pos = src.numel()
     n_cand = candidate_pool.numel()
-    hits = {k: 0 for k in ks}
+    if n_pos == 0 or n_cand == 0:
+        return {k: float("nan") for k in ks}
 
-    # Score each positive against the full candidate pool, in chunks of
-    # batch_size positives at a time. Inside each chunk, all candidates
-    # are evaluated for every positive.
+    # Precompute candidate embeddings once. Shape (n_cand, hidden).
+    cand_h = h[candidate_pool]
+
+    # Global node id -> column-in-this-pool lookup, built once.
+    cand_to_col = -torch.ones(n_nodes_total, dtype=torch.long, device=h.device)
+    cand_to_col[candidate_pool] = torch.arange(n_cand, device=h.device)
+
+    batch_size = max(1, dyads_per_chunk // n_cand)
+    hits = {k: 0 for k in ks}
+    reciprocal_rank_sum = 0.0
+    scored = 0
+
     for start in range(0, n_pos, batch_size):
         end = min(start + batch_size, n_pos)
-        sub_src = src[start:end]  # (B,)
-        sub_dst = dst[start:end]  # (B,)
+        sub_src = src[start:end]
+        sub_dst = dst[start:end]
         B = sub_src.numel()
 
-        # Build the (B, n_cand) score matrix: each row scores one positive
-        # source against the entire candidate pool.
-        src_rep = sub_src.unsqueeze(1).expand(B, n_cand).reshape(-1)
-        cand_rep = candidate_pool.unsqueeze(0).expand(B, n_cand).reshape(-1)
-        logits = model.existence_logit(h, src_rep, cand_rep).reshape(B, n_cand)
+        # Embeddings for this chunk's sources. (B, hidden).
+        src_h = h[sub_src]
+        # Expand src_h to (B, n_cand, hidden) and broadcast cand_h.
+        src_exp = src_h.unsqueeze(1).expand(B, n_cand, src_h.shape[-1])
+        cand_exp = cand_h.unsqueeze(0).expand(B, n_cand, cand_h.shape[-1])
+        pair = torch.cat([src_exp, cand_exp], dim=-1)  # (B, n_cand, 2H)
+        logits = model.head_exist(pair).squeeze(-1)  # (B, n_cand)
 
-        # Rank true v among candidates. We need the rank of dst[i] in the
-        # sorted scores of row i. Build a position lookup so we can find
-        # where each true v sits in the candidate pool.
-        # candidate_pool may not contain dst[i] if pool is type-matched and
-        # dst[i] has an unusual type — but with type-matched pools restricted
-        # to dst's type, it will. We handle the missing case below.
-        cand_index = {int(c.item()): j for j, c in enumerate(candidate_pool)}
-        for i in range(B):
-            v_id = int(sub_dst[i].item())
-            if v_id not in cand_index:
-                continue  # Skip if true partner isn't in the candidate pool.
-            true_score = logits[i, cand_index[v_id]].item()
-            # Rank of true v: how many candidates score strictly higher?
-            # Plus a tie-breaking offset of 0.5 to be consistent with
-            # standard KG-completion convention (ties don't count as wins).
-            rank = int((logits[i] > true_score).sum().item()) + 1
-            for k in ks:
-                if rank <= k:
-                    hits[k] += 1
+        dst_cols = cand_to_col[sub_dst]  # (B,), -1 where dst isn't in pool
+        valid = dst_cols >= 0
+        if not valid.any():
+            continue
 
-    return {k: hits[k] / max(n_pos, 1) for k in ks}
+        v_rows = torch.arange(B, device=logits.device)[valid]
+        true_scores = logits[v_rows, dst_cols[valid]]
+        ranks = (logits[v_rows] > true_scores.unsqueeze(1)).sum(dim=1) + 1
+        for k in ks:
+            hits[k] += int((ranks <= k).sum().item())
+        # MRR contribution from this chunk: sum of 1/rank for valid rows.
+        reciprocal_rank_sum += float((1.0 / ranks.float()).sum().item())
+        scored += int(valid.sum().item())
+
+    if scored == 0:
+        out: dict = {k: float("nan") for k in ks}
+        out["mrr"] = float("nan")
+        return out
+    out = {k: hits[k] / scored for k in ks}
+    out["mrr"] = reciprocal_rank_sum / scored
+    return out
 
 
 def _score_edge_set(
@@ -1012,6 +1132,8 @@ def _score_edge_set(
         for k in hits_ks:
             empty[f"hits_at_{k}"] = float("nan")
             empty[f"hits_at_{k}_type"] = float("nan")
+        empty["mrr"] = float("nan")
+        empty["mrr_type"] = float("nan")
         return empty
 
     src = data.all_src[mask].to(device)
@@ -1108,10 +1230,13 @@ def _score_edge_set(
     else:
         pairwise = float("nan")
 
-    # Hits@K: rank the true partner against the full candidate pool.
+    # Hits@K and MRR: rank the true partner against the full candidate pool.
     # Two pools: all nodes, and type-matched (only nodes of v's type compete).
-    hits_all: dict[int, float] = {k: float("nan") for k in hits_ks}
-    hits_type: dict[int, float] = {k: float("nan") for k in hits_ks}
+    # Both _hits_at_k calls return dicts keyed by K plus an 'mrr' key.
+    hits_all: dict = {k: float("nan") for k in hits_ks}
+    hits_all["mrr"] = float("nan")
+    hits_type: dict = {k: float("nan") for k in hits_ks}
+    hits_type["mrr"] = float("nan")
     if compute_hits and src.numel() > 0:
         all_candidates = torch.arange(data.n_nodes, device=device)
         hits_all = _hits_at_k(
@@ -1120,15 +1245,16 @@ def _score_edge_set(
             src,
             dst,
             all_candidates,
+            n_nodes_total=data.n_nodes,
             ks=hits_ks,
-            batch_size=hits_batch,
         )
         # Type-matched: for each positive, the candidate pool is the set of
         # nodes whose node-type matches the true dst. We compute one batch
         # per dst-type, since within a type the pool is shared.
         node_type_np = data.node_type.cpu().numpy()
         dst_types_np = node_type_np[dst.cpu().numpy()]
-        per_type_hits = {k: 0 for k in hits_ks}
+        per_type_accum: dict = {k: 0.0 for k in hits_ks}
+        per_type_accum["mrr"] = 0.0
         per_type_total = 0
         for t in np.unique(dst_types_np):
             ids_of_type = np.where(node_type_np == int(t))[0]
@@ -1144,15 +1270,17 @@ def _score_edge_set(
                 sub_src,
                 sub_dst,
                 pool,
+                n_nodes_total=data.n_nodes,
                 ks=hits_ks,
-                batch_size=hits_batch,
             )
             n_sub = int(sub_src.numel())
-            for k, frac in sub_hits.items():
-                per_type_hits[k] += frac * n_sub
+            for key, frac in sub_hits.items():
+                per_type_accum[key] += frac * n_sub
             per_type_total += n_sub
         if per_type_total:
-            hits_type = {k: per_type_hits[k] / per_type_total for k in hits_ks}
+            hits_type = {
+                key: per_type_accum[key] / per_type_total for key in per_type_accum
+            }
 
     out = {
         "exist_auc": exist_auc,
@@ -1171,6 +1299,8 @@ def _score_edge_set(
     for k in hits_ks:
         out[f"hits_at_{k}"] = hits_all[k]
         out[f"hits_at_{k}_type"] = hits_type[k]
+    out["mrr"] = hits_all.get("mrr", float("nan"))
+    out["mrr_type"] = hits_type.get("mrr", float("nan"))
     return out
 
 

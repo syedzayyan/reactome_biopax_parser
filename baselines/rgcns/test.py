@@ -36,7 +36,6 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import torch
-
 from fish_rgcn import FISHRGCN, build_dataset, evaluate, train
 
 # ── condition definition ────────────────────────────────────────────────────
@@ -253,6 +252,8 @@ def summary_table(results: list[dict]) -> pd.DataFrame:
     metric_cols = [
         "exist_auc",  # existence vs random negatives (semi-inductive bridge)
         "exist_auc_smart",  # existence vs smart negatives  (semi-inductive bridge)
+        "mrr",
+        "mrr_type",  # mean reciprocal rank
         "hits_at_1",
         "hits_at_10",
         "hits_at_100",  # all-nodes pool
@@ -265,6 +266,8 @@ def summary_table(results: list[dict]) -> pd.DataFrame:
         "order_pairwise_acc",
         "ind_exist_auc",
         "ind_exist_auc_smart",
+        "ind_mrr",
+        "ind_mrr_type",
         "ind_hits_at_1",
         "ind_hits_at_10",
         "ind_hits_at_100",
