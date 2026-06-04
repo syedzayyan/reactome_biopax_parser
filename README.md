@@ -121,6 +121,74 @@ G = parser.parse_biopax_into_networkx("pathway.owl")
 
 `ReactomeBioPAX` is composed via mixins; users only interact with the unified class.
 
+## Running the GNN benchmarks
+
+`run_benchmarks.sh` at the project root tunes and/or runs all three GNN baselines (RGCN, TGAT, HGCN) in one command. See [`baselines/GNNs/README.md`](baselines/GNNs/README.md) for the full benchmark description.
+
+```bash
+# Run all three models on the Immune pathway (no tuning, default settings)
+./run_benchmarks.sh
+
+# Tune then benchmark on GPU, saving results to a custom directory
+./run_benchmarks.sh --tune --gpu --out-dir results/immune_tuned
+
+# Only benchmark TGAT and HGCN using a pre-featurised pickle
+./run_benchmarks.sh --models tgat,hgcn --pickle immune.pkl
+
+# Quick smoke-test
+./run_benchmarks.sh --epochs 50 --seeds 2
+```
+
+### Flag reference
+
+| Flag | Default | Description |
+|---|---|---|
+| `--biopax PATH` | `data/biopax3/R-HSA-168256.xml` | BioPAX XML to parse. Mutually exclusive with `--pickle`. |
+| `--pickle PATH` | — | Pre-featurised graph pickle. Skips parsing (much faster for repeated runs). |
+| `--pathway-name NAME` | `Immune` | Human-readable name embedded in output files and summary tables. |
+| `--models LIST` | `rgcn,tgat,hgcn` | Comma-separated subset of models to run. |
+| `--tune` | off | Run Optuna sweeps before benchmarking and apply the best params. |
+| `--n-trials N` | `50` | Optuna trials per model (only used with `--tune`). |
+| `--epochs N` | `200` | Training epochs per benchmark run. |
+| `--seeds N` | `5` | Random seeds per condition (results reported as mean ± std). |
+| `--hidden N` | `128` | Encoder hidden dimension. |
+| `--n-layers N` | `2` | Number of encoder layers. |
+| `--lr LR` | `0.001` | Learning rate. |
+| `--dropout D` | `0.2` | Dropout rate. |
+| `--n-negatives N` | `10` | Negative samples per positive (existence head). |
+| `--order-weight W` | `1.0` | Extra weight on the order-task loss. |
+| `--time-target MODE` | `min_max` | Order regression target transform (`min_max`, `log_min_max`, `rank`). |
+| `--hits` | off | Compute Hits@K (expensive). |
+| `--smart-train` | off | Type-matched negatives during training. |
+| `--compartment-emb PATH` | — | `.npz`/`.pkl`/`.tsv` of compartment embeddings (e.g. GO2Vec). |
+| `--out-dir DIR` | `results` | Output directory (created if absent). |
+| `--gpu` | auto | Force CUDA. |
+| `--cpu` | auto | Force CPU. |
+| `--venv PATH` | `.venv` | Virtual environment to activate. |
+| `--storage URL` | `sqlite:///results/optuna_studies.db` | Optuna storage shared by all tuners. |
+| `--include-rgat` | off | *(RGCN only)* Also run RGAT conditions (12 → 24 conditions). |
+| `--n-heads N` | `2` (TGAT) / `1` (HGCN) | Attention heads. |
+| `--time-dim N` | `64` | *(TGAT only)* Time2Vec output dimension. |
+| `--edge-feat-dim N` | `32` | *(TGAT only)* Edge-type embedding dimension. |
+| `--max-neighbors N` | `20` | *(TGAT only)* Most-recent neighbours per node during encoding. |
+| `--use-attention` | off | *(HGCN only)* Use attention variant of `HypergraphConv`. |
+
+All output files land in `--out-dir`:
+
+```
+results/
+  results_rgcn.json / .csv
+  results_tgat.json / .csv
+  results_hgcn.json / .csv
+  best_params_rgcn.json       # only when --tune
+  best_params_tgat.json
+  best_params_hgcn.json
+  optuna_history_rgcn.csv
+  optuna_history_tgat.csv
+  optuna_history_hgcn.csv
+  optuna_studies.db           # shared Optuna SQLite store
+```
+
 ## Citing
 
 If you use this in academic work, please cite the FISH paper:
