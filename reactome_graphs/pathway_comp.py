@@ -49,11 +49,13 @@ from __future__ import annotations
 from collections import Counter
 from typing import Optional
 
-import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 import pandas as pd
-from matplotlib.lines import Line2D
+
+# matplotlib is optional — only needed for summary_figure().
+# Import lazily inside the methods that use it so that
+# `import reactome_graphs` works without matplotlib installed.
 
 # ── styling ────────────────────────────────────────────────────────────────
 _FG = "#2e3440"
@@ -259,7 +261,7 @@ class PathwaySet:
 
     # ── the single comparison figure ─────────────────────────────────────────
 
-    def summary_figure(self, figsize=(11, 7), fontsize: int = 8) -> plt.Figure:
+    def summary_figure(self, figsize=(11, 7), fontsize: int = 8):
         """
         Six-panel cross-pathway comparison figure.
 
@@ -272,6 +274,9 @@ class PathwaySet:
         e  node recruitment overlay (normalised rank)
         f  connectivity breakdown (giant vs fragment fractions)
         """
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D  # noqa: F401 (used below)
+
         with plt.rc_context(_RC):
             fig = plt.figure(figsize=figsize)
             fig.patch.set_facecolor(_BG)

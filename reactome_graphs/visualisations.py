@@ -32,7 +32,10 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from typing import Optional
 
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None  # type: ignore[assignment]
 import networkx as nx
 import numpy as np
 
