@@ -21,7 +21,6 @@ Run everything including network tests:
     pytest tests/test_download_and_parse.py -v --run-network
 """
 
-import os
 import tempfile
 from pathlib import Path
 
@@ -37,14 +36,15 @@ from reactome_graphs import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Small pathway already on disk (R-HSA-139910, ~200 KB).
-# 10 nodes, 14 edges, 4 edge types — fast to parse (< 1 s).
+# Fixture file committed to tests/fixtures/ so the fast tests run in CI
+# without any network access. (54 KB, 10 nodes, 14 edges, 4 edge types.)
 SMALL_PATHWAY_ID = "R-HSA-139910"
-SMALL_PATHWAY_FILE = Path("data/biopax3") / f"{SMALL_PATHWAY_ID}.xml"
+SMALL_PATHWAY_FILE = Path(__file__).parent / "fixtures" / f"{SMALL_PATHWAY_ID}.xml"
 
 # The Immune System pathway used by the GNN benchmarks (~42 MB).
+# Not committed — downloaded on demand by the network test.
 IMMUNE_PATHWAY_ID = "R-HSA-168256"
-IMMUNE_PATHWAY_FILE = Path("data/biopax3") / f"{IMMUNE_PATHWAY_ID}.xml"
+IMMUNE_PATHWAY_FILE = Path(__file__).parent.parent / "data" / "biopax3" / f"{IMMUNE_PATHWAY_ID}.xml"
 
 KNOWN_EDGE_TYPES = {
     "reaction",
