@@ -14,9 +14,6 @@ dependencies = [
 
     # Core ML
     "torch>=2.2",
-
-    # R bridge (optional but included here)
-    "rpy2>=3.5"
 ]
 
 [project.optional-dependencies]

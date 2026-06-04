@@ -36,7 +36,9 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import torch
+
 from fish_rgcn import FISHRGCN, build_dataset, evaluate, train
+
 
 # ── condition definition ────────────────────────────────────────────────────
 
@@ -44,10 +46,10 @@ from fish_rgcn import FISHRGCN, build_dataset, evaluate, train
 @dataclass
 class Condition:
     name: str
-    architecture: str  # 'rgcn' | 'rgat'
+    architecture: str          # 'rgcn' | 'rgat'
     time_encoding: bool
     use_compartment: bool
-    order_mode: str  # 'regression' | 'corn' | 'coral'
+    order_mode: str            # 'regression' | 'corn' | 'coral'
 
     @property
     def loss_weights(self) -> tuple[float, float, float]:
@@ -80,15 +82,13 @@ def _make_conditions(architectures: tuple[str, ...] = ("rgcn",)) -> list[Conditi
                         name_parts.append("+c")
                     name_parts.append("/")
                     name_parts.append(decoder)
-                    conditions.append(
-                        Condition(
-                            name=" ".join(name_parts).replace(" /", " /"),
-                            architecture=arch,
-                            time_encoding=time_enc,
-                            use_compartment=comp,
-                            order_mode=decoder,
-                        )
-                    )
+                    conditions.append(Condition(
+                        name=" ".join(name_parts).replace(" /", " /"),
+                        architecture=arch,
+                        time_encoding=time_enc,
+                        use_compartment=comp,
+                        order_mode=decoder,
+                    ))
     return conditions
 
 
@@ -99,9 +99,7 @@ CONDITIONS = _make_conditions()
 # ── pathway loading ─────────────────────────────────────────────────────────
 
 
-def load_and_featurise(
-    biopax_path: str, reaction_partners: bool, include_complexes: bool
-):
+def load_and_featurise(biopax_path: str, reaction_partners: bool, include_complexes: bool):
     """
     Parse and featurise once. Returns the prepared networkx graph.
 
@@ -126,7 +124,6 @@ def load_and_featurise(
 def load_pickled_graph(pickle_path: str):
     """Alternative loader if you've already parsed + featurised once."""
     import pickle
-
     with open(pickle_path, "rb") as fh:
         return pickle.load(fh)
 
@@ -148,13 +145,14 @@ def load_compartment_embeddings(path: str) -> dict:
     if suffix == ".npz":
         npz = np.load(p, allow_pickle=False)
         if "keys" not in npz or "vectors" not in npz:
-            raise ValueError(f"{path}: .npz must contain 'keys' and 'vectors' arrays.")
+            raise ValueError(
+                f"{path}: .npz must contain 'keys' and 'vectors' arrays."
+            )
         keys = [k.decode() if isinstance(k, bytes) else str(k) for k in npz["keys"]]
         vectors = npz["vectors"].astype(np.float32)
         return {k: vectors[i] for i, k in enumerate(keys)}
     if suffix in (".pkl", ".pickle"):
         import pickle
-
         with open(p, "rb") as fh:
             obj = pickle.load(fh)
         if not isinstance(obj, dict):
@@ -201,6 +199,11 @@ def run_one(
     compartment_embeddings: Optional[dict] = None,
     verbose: bool = False,
     compute_hits: bool = False,
+    smart_train: bool = False,
+    n_negatives: int = 10,
+    time_target: str = "min_max",
+    dropout: float = 0.2,
+    order_weight: float = 1.0,
 ) -> dict:
     set_seed(seed)
     data = build_dataset(
@@ -210,30 +213,37 @@ def run_one(
         order_mode=condition.order_mode,
         n_order_bins=n_order_bins,
         compartment_embeddings=compartment_embeddings,
+        time_target=time_target,
         seed=seed,
     )
     model = FISHRGCN(
         data,
         hidden=hidden,
         n_layers=n_layers,
+        dropout=dropout,
         order_mode=condition.order_mode,
         n_order_bins=n_order_bins,
         time_encoding=condition.time_encoding,
         time_dim=time_dim,
         architecture=condition.architecture,
         use_compartment=condition.use_compartment,
+        smart_negatives=smart_train,
+        n_negatives=n_negatives,
     )
+    # Scale the order-loss weight by the user-supplied factor on top of the
+    # CORAL down-weighting that already lives on Condition.loss_weights.
+    base_lw = condition.loss_weights
+    effective_lw = (base_lw[0], base_lw[1], base_lw[2] * order_weight)
     start = time.time()
     train(
-        model,
-        data,
-        epochs=epochs,
-        lr=lr,
-        loss_weights=condition.loss_weights,
+        model, data,
+        epochs=epochs, lr=lr,
+        loss_weights=effective_lw,
         device=device,
         log_every=epochs if not verbose else max(epochs // 10, 1),
     )
-    metrics = evaluate(model, data, device=device, seed=seed, compute_hits=compute_hits)
+    metrics = evaluate(model, data, device=device, seed=seed,
+                       compute_hits=compute_hits)
     metrics["seconds"] = round(time.time() - start, 1)
     metrics["seed"] = seed
     metrics["condition"] = condition.name
@@ -241,6 +251,9 @@ def run_one(
     metrics["time_encoding"] = condition.time_encoding
     metrics["use_compartment"] = condition.use_compartment
     metrics["order_mode"] = condition.order_mode
+    metrics["time_target"] = time_target
+    metrics["n_negatives"] = n_negatives
+    metrics["smart_train"] = smart_train
     return metrics
 
 
@@ -250,30 +263,20 @@ def run_one(
 def summary_table(results: list[dict]) -> pd.DataFrame:
     df = pd.DataFrame(results)
     metric_cols = [
-        "exist_auc",  # existence vs random negatives (semi-inductive bridge)
-        "exist_auc_smart",  # existence vs smart negatives  (semi-inductive bridge)
-        "mrr",
-        "mrr_type",  # mean reciprocal rank
-        "hits_at_1",
-        "hits_at_10",
-        "hits_at_100",  # all-nodes pool
-        "hits_at_1_type",
-        "hits_at_10_type",
-        "hits_at_100_type",  # type-matched
+        "exist_auc",            # existence vs random negatives (semi-inductive bridge)
+        "exist_auc_smart",      # existence vs smart negatives  (semi-inductive bridge)
+        "mrr", "mrr_type",                                  # mean reciprocal rank
+        "hits_at_1", "hits_at_10", "hits_at_100",           # all-nodes pool
+        "hits_at_1_type", "hits_at_10_type", "hits_at_100_type",  # type-matched
         "type_macro_auc",
         "type_top1",
         "order_spearman",
         "order_pairwise_acc",
         "ind_exist_auc",
         "ind_exist_auc_smart",
-        "ind_mrr",
-        "ind_mrr_type",
-        "ind_hits_at_1",
-        "ind_hits_at_10",
-        "ind_hits_at_100",
-        "ind_hits_at_1_type",
-        "ind_hits_at_10_type",
-        "ind_hits_at_100_type",
+        "ind_mrr", "ind_mrr_type",
+        "ind_hits_at_1", "ind_hits_at_10", "ind_hits_at_100",
+        "ind_hits_at_1_type", "ind_hits_at_10_type", "ind_hits_at_100_type",
     ]
     metric_cols = [c for c in metric_cols if c in df.columns]
 
@@ -283,8 +286,7 @@ def summary_table(results: list[dict]) -> pd.DataFrame:
     out = pd.DataFrame(index=means.index)
     for col in metric_cols:
         out[col] = [
-            f"{m:+.3f} ± {s:.3f}"
-            if "spearman" in col or "rho" in col
+            f"{m:+.3f} ± {s:.3f}" if "spearman" in col or "rho" in col
             else f"{m:.3f} ± {s:.3f}"
             for m, s in zip(means[col], stds[col])
         ]
@@ -302,9 +304,8 @@ def main():
     parser.add_argument("--pathway-name", default="Pathway")
     parser.add_argument("--reaction-partners", action="store_true")
     parser.add_argument(
-        "--no-complexes",
-        action="store_true",
-        help="Pass include_complexes=False to the parser.",
+        "--no-complexes", action="store_true",
+        help="Pass include_complexes=False to the parser."
     )
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--hidden", type=int, default=128)
@@ -313,51 +314,70 @@ def main():
     parser.add_argument("--n-order-bins", type=int, default=20)
     parser.add_argument("--time-dim", type=int, default=64)
     parser.add_argument(
-        "--seeds", type=int, default=5, help="Number of seeds; sweeps 0..seeds-1."
+        "--dropout", type=float, default=0.2,
+        help="Dropout rate inside the encoder and heads. Tuned-recommended: 0.20."
     )
     parser.add_argument(
-        "--device",
-        default=None,
-        help="Override device: cuda | cuda:0 | cpu | mps. "
-        "Default: auto-detect (cuda > mps > cpu).",
+        "--order-weight", type=float, default=1.0,
+        help="Weight on the order loss in the multi-task sum. Tuned-recommended: "
+             "~5.0 for CORAL (the order task was undertrained at the default 1.0)."
     )
     parser.add_argument(
-        "--gpu",
-        action="store_true",
-        help="Shortcut: force CUDA if available, error if not. "
-        "Equivalent to --device cuda.",
+        "--time-target", default="min_max",
+        choices=["min_max", "log_min_max", "rank"],
+        help="Transform applied to raw step times before computing the "
+             "regression target for the order head. 'min_max' is linear "
+             "scaling to [0,1] (default), 'log_min_max' compresses the tail "
+             "via log(1+t), 'rank' produces a uniform marginal via rank/N. "
+             "Only affects order_mode=regression conditions; CORN/CORAL use "
+             "quantile bins regardless."
     )
+    parser.add_argument("--seeds", type=int, default=5,
+                        help="Number of seeds; sweeps 0..seeds-1.")
+    parser.add_argument("--device", default=None,
+                        help="Override device: cuda | cuda:0 | cpu | mps. "
+                             "Default: auto-detect (cuda > mps > cpu).")
+    parser.add_argument("--gpu", action="store_true",
+                        help="Shortcut: force CUDA if available, error if not. "
+                             "Equivalent to --device cuda.")
+    parser.add_argument("--cpu", action="store_true",
+                        help="Shortcut: force CPU (useful for debugging or "
+                             "when MPS auto-detect is misbehaving).")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print per-epoch losses for each run.")
     parser.add_argument(
-        "--cpu",
-        action="store_true",
-        help="Shortcut: force CPU (useful for debugging or "
-        "when MPS auto-detect is misbehaving).",
-    )
-    parser.add_argument(
-        "--verbose", action="store_true", help="Print per-epoch losses for each run."
-    )
-    parser.add_argument(
-        "--hits",
-        action="store_true",
+        "--hits", action="store_true",
         help="Also compute Hits@K (K=1, 10, 100) against all-nodes and "
-        "type-matched candidate pools. Expensive (~minutes per run on "
-        "Immune-sized graphs).",
+             "type-matched candidate pools. Expensive (~minutes per run on "
+             "Immune-sized graphs)."
     )
     parser.add_argument(
-        "--include-rgat",
-        action="store_true",
+        "--smart-train", action="store_true",
+        help="Train the existence head with type-matched negatives (drawn "
+             "from the destination's node-type pool) instead of uniform "
+             "random negatives. In our experiments this improves "
+             "exist_auc_smart marginally but degrades Hits@K by ~50%, "
+             "reported as an ablation."
+    )
+    parser.add_argument(
+        "--n-negatives", type=int, default=10,
+        help="Number of negative samples per positive during training. "
+             "Affects both random and smart-train modes. "
+             "Standard range 5-20; default 10."
+    )
+    parser.add_argument(
+        "--include-rgat", action="store_true",
         help="Also run RGAT conditions. Default: RGCN only (12 conditions). "
-        "With --include-rgat: 24 conditions, ~2.5x runtime.",
+             "With --include-rgat: 24 conditions, ~2.5x runtime."
     )
     parser.add_argument("--out-json", default="results.json")
     parser.add_argument("--out-csv", default="results.csv")
     parser.add_argument(
-        "--compartment-embeddings",
-        default=None,
+        "--compartment-embeddings", default=None,
         help="Path to a .npz/.pkl/.tsv of compartment embeddings (e.g. GO2Vec). "
-        "When provided, conditions with use_compartment=True use these "
-        "vectors. When omitted, a one-hot per compartment vocab is used "
-        "instead — equivalent to a learned embedding via the input projection.",
+             "When provided, conditions with use_compartment=True use these "
+             "vectors. When omitted, a one-hot per compartment vocab is used "
+             "instead — equivalent to a learned embedding via the input projection."
     )
     args = parser.parse_args()
 
@@ -396,37 +416,29 @@ def main():
         )
     else:
         G = load_pickled_graph(args.pickle)
-    print(f"[main] Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+    print(f"[main] Graph: {G.number_of_nodes()} nodes, "
+          f"{G.number_of_edges()} edges")
 
     # Load compartment embeddings once if a path was given. The same dict
     # is passed to every run_one call; build_dataset uses it only when the
     # condition has use_compartment=True (otherwise the dict is unused).
     compartment_embeddings = None
     if args.compartment_embeddings:
-        print(
-            f"[main] Loading compartment embeddings from {args.compartment_embeddings}"
-        )
-        compartment_embeddings = load_compartment_embeddings(
-            args.compartment_embeddings
-        )
+        print(f"[main] Loading compartment embeddings from "
+              f"{args.compartment_embeddings}")
+        compartment_embeddings = load_compartment_embeddings(args.compartment_embeddings)
         emb_dim = len(next(iter(compartment_embeddings.values())))
         print(f"[main]   {len(compartment_embeddings)} terms, dim={emb_dim}")
     else:
-        print(
-            "[main] No compartment-embeddings file given; "
-            "compartment conditions will use a one-hot vocabulary "
-            "(learned compartment embedding via the input projection)."
-        )
+        print("[main] No compartment-embeddings file given; "
+              "compartment conditions will use a one-hot vocabulary "
+              "(learned compartment embedding via the input projection).")
 
     n_runs = len(CONDITIONS) * args.seeds
-    print(
-        f"[main] Running {len(CONDITIONS)} conditions x {args.seeds} seeds "
-        f"= {n_runs} runs on device={device}"
-    )
-    print(
-        f"[main] epochs={args.epochs}  hidden={args.hidden}  "
-        f"lr={args.lr}  n_order_bins={args.n_order_bins}"
-    )
+    print(f"[main] Running {len(CONDITIONS)} conditions x {args.seeds} seeds "
+          f"= {n_runs} runs on device={device}")
+    print(f"[main] epochs={args.epochs}  hidden={args.hidden}  "
+          f"lr={args.lr}  n_order_bins={args.n_order_bins}")
 
     results = []
     for ci, condition in enumerate(CONDITIONS, 1):
@@ -434,21 +446,21 @@ def main():
             run_idx = (ci - 1) * args.seeds + seed + 1
             print(f"\n[{run_idx}/{n_runs}] {condition.name}  seed={seed}")
             m = run_one(
-                G,
-                condition,
-                seed,
-                epochs=args.epochs,
-                hidden=args.hidden,
-                n_layers=args.n_layers,
-                lr=args.lr,
-                n_order_bins=args.n_order_bins,
-                time_dim=args.time_dim,
+                G, condition, seed,
+                epochs=args.epochs, hidden=args.hidden,
+                n_layers=args.n_layers, lr=args.lr,
+                n_order_bins=args.n_order_bins, time_dim=args.time_dim,
                 device=device,
                 compartment_embeddings=(
                     compartment_embeddings if condition.use_compartment else None
                 ),
                 verbose=args.verbose,
                 compute_hits=args.hits,
+                smart_train=args.smart_train,
+                n_negatives=args.n_negatives,
+                time_target=args.time_target,
+                dropout=args.dropout,
+                order_weight=args.order_weight,
             )
             print(
                 f"  exist={m['exist_auc']:.3f}/{m.get('exist_auc_smart', float('nan')):.3f}  "
@@ -463,10 +475,8 @@ def main():
     # Persist raw + summary.
     json_safe = []
     for r in results:
-        r_clean = {
-            k: (v if not isinstance(v, (np.floating, np.integer)) else float(v))
-            for k, v in r.items()
-        }
+        r_clean = {k: (v if not isinstance(v, (np.floating, np.integer))
+                       else float(v)) for k, v in r.items()}
         json_safe.append(r_clean)
     with open(args.out_json, "w") as fh:
         json.dump(json_safe, fh, indent=2)
@@ -475,7 +485,8 @@ def main():
 
     # Print mean +/- std table.
     print("\n" + "=" * 72)
-    print(f"SUMMARY: {args.pathway_name}, semi-inductive split, {args.seeds} seeds")
+    print(f"SUMMARY: {args.pathway_name}, semi-inductive split, "
+          f"{args.seeds} seeds")
     print("=" * 72)
     summary = summary_table(results)
     with pd.option_context("display.max_colwidth", 32, "display.width", 200):

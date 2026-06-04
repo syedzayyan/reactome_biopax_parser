@@ -46,14 +46,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from coral_pytorch.dataset import corn_label_from_logits as _corn_label_from_logits
-from coral_pytorch.losses import coral_loss as _coral_loss
+from torch_geometric.nn import MessagePassing, RGATConv, RGCNConv
 
 # coral-pytorch provides reference CORN and CORAL implementations from the
 # authors of those papers (Raschka et al.). Used here in preference to a
 # handrolled loss so the comparison is canonical and not algorithm-confounded.
 from coral_pytorch.losses import corn_loss as _corn_loss
-from torch_geometric.nn import MessagePassing, RGATConv, RGCNConv
+from coral_pytorch.losses import coral_loss as _coral_loss
+from coral_pytorch.dataset import corn_label_from_logits as _corn_label_from_logits
+
 
 # ── time encoding (GraphMixer-style, Cong et al. 2023) ──────────────────────
 
@@ -79,7 +80,9 @@ class TimeEncode(nn.Module):
         self.w.weight = nn.Parameter(
             torch.from_numpy(freqs).reshape(self.dim, 1), requires_grad=False
         )
-        self.w.bias = nn.Parameter(torch.zeros(self.dim), requires_grad=False)
+        self.w.bias = nn.Parameter(
+            torch.zeros(self.dim), requires_grad=False
+        )
 
     @torch.no_grad()
     def forward(self, t: torch.Tensor) -> torch.Tensor:
@@ -130,14 +133,19 @@ class RGCNTimeConv(MessagePassing):
         edge_type: torch.Tensor,
         edge_time_feat: torch.Tensor,
     ) -> torch.Tensor:
-        # Per-edge source projection through the relation-specific weight:
-        #   msg_rel[e, o] = sum_i  x[src(e), i] * W_rel[rel(e), i, o]
-        src_feat = x[edge_index[0]]  # (E, in_dim)
-        rel_W = self.W_rel[edge_type]  # (E, in_dim, out_dim)
-        msg_rel = torch.einsum("ei,eio->eo", src_feat, rel_W)  # (E, out_dim)
+        # Relational projection. The naive per-edge gather (rel_W = W_rel[
+        # edge_type], shape (E, in_dim, out_dim)) materialises a tensor that
+        # is E * in_dim * out_dim floats — 58 GB at E=14k, hidden=1024.
+        # Instead, project ALL source features under every relation matrix
+        # once -> (N, R, out_dim) -> then gather by edge_type for each edge.
+        # Memory drops from O(E * H^2) to O(N * R * H) + O(E * H).
+        all_proj = torch.einsum("ni,rio->nro", x, self.W_rel)   # (N, R, out_dim)
+        # Gather: for edge e, take row src[e] and relation rel[e].
+        src_ids = edge_index[0]                                  # (E,)
+        msg_rel = all_proj[src_ids, edge_type]                   # (E, out_dim)
 
         # Add time term per edge.
-        msg = msg_rel + self.W_time(edge_time_feat)  # (E, out_dim)
+        msg = msg_rel + self.W_time(edge_time_feat)              # (E, out_dim)
 
         # Aggregate by destination. Pass `size` so destination tensor has
         # full N rows (otherwise propagate omits nodes with no incoming edges).
@@ -150,6 +158,7 @@ class RGCNTimeConv(MessagePassing):
         return msg
 
 
+
 # ── data container ──────────────────────────────────────────────────────────
 
 
@@ -160,21 +169,21 @@ class FISHData:
     # Per-node-type feature arrays, each shape (n_nodes_of_type, type_dim).
     feats_by_type: dict[int, torch.Tensor]
     # node_id -> node_type id (int)
-    node_type: torch.Tensor  # (N,) long
+    node_type: torch.Tensor                       # (N,) long
     # For each node, its row index inside its type's feature matrix.
-    node_intratype_idx: torch.Tensor  # (N,) long
+    node_intratype_idx: torch.Tensor              # (N,) long
     # Edge index over the full node set (training-edges only by default).
-    edge_index: torch.Tensor  # (2, E_train) long
-    edge_type: torch.Tensor  # (E_train,) long
-    edge_time: torch.Tensor  # (E,) float (all edges)
+    edge_index: torch.Tensor                      # (2, E_train) long
+    edge_type: torch.Tensor                       # (E_train,) long
+    edge_time: torch.Tensor                       # (E,) float (all edges)
 
     # All edges including test (used by the heads and for evaluation):
-    all_src: torch.Tensor  # (E,) long
-    all_dst: torch.Tensor  # (E,) long
-    all_type: torch.Tensor  # (E,) long
-    all_time: torch.Tensor  # (E,) float
-    train_mask: torch.Tensor  # (E,) bool
-    test_mask: torch.Tensor  # (E,) bool
+    all_src: torch.Tensor                         # (E,) long
+    all_dst: torch.Tensor                         # (E,) long
+    all_type: torch.Tensor                        # (E,) long
+    all_time: torch.Tensor                        # (E,) float
+    train_mask: torch.Tensor                      # (E,) bool
+    test_mask: torch.Tensor                       # (E,) bool
     # Inductive test mask: edges with neither endpoint seen during training.
     # Populated only by the semi-inductive split; otherwise all-False. Lets
     # these otherwise-discarded edges contribute a separate "feature-only"
@@ -182,8 +191,14 @@ class FISHData:
     # endpoint and must score from features alone.
     inductive_mask: Optional[torch.Tensor] = None
 
-    # Ordinal targets (only used if order_mode='corn').
-    order_bin: Optional[torch.Tensor] = None  # (E,) long in [0, n_bins-1]
+    # Ordinal targets (only used if order_mode='corn' or 'coral').
+    order_bin: Optional[torch.Tensor] = None      # (E,) long in [0, n_bins-1]
+
+    # Regression target for the order head, transformed from raw step times
+    # according to the chosen ``time_target`` mode (see build_dataset).
+    # Stored on the dataset so the loss reads from here directly, rather
+    # than recomputing the normalisation inside the training loop.
+    order_target: Optional[torch.Tensor] = None   # (E,) float in [0, 1]
 
     # Per-node compartment feature, shape (N, compartment_dim). Zero matrix
     # when compartment features were not requested (handled by use_compartment
@@ -223,6 +238,7 @@ def build_dataset(
     compartment_embeddings: Optional[dict] = None,
     compartment_dim: int = 32,
     force_unseen: Optional[list] = None,
+    time_target: str = "min_max",
     seed: int = 0,
 ) -> FISHData:
     """
@@ -270,9 +286,7 @@ def build_dataset(
     type_to_idx = {t: i for i, t in enumerate(node_type_names)}
 
     # Per-type feature matrices, with per-node intra-type row indexing.
-    feats_by_type: dict[int, list[np.ndarray]] = {
-        i: [] for i in range(len(node_type_names))
-    }
+    feats_by_type: dict[int, list[np.ndarray]] = {i: [] for i in range(len(node_type_names))}
     intratype_idx = np.zeros(n_nodes, dtype=np.int64)
     node_type_arr = np.zeros(n_nodes, dtype=np.int64)
     for nid, name in enumerate(nodes):
@@ -289,9 +303,7 @@ def build_dataset(
     for ti, lst in feats_by_type.items():
         if not lst:
             # No nodes of this type — empty tensor with sane dim.
-            feats_tensors[ti] = torch.zeros(
-                (0, embed_dim_fallback), dtype=torch.float32
-            )
+            feats_tensors[ti] = torch.zeros((0, embed_dim_fallback), dtype=torch.float32)
             continue
         # All vectors of one type should already share a dim (e.g. all
         # proteins are ESM-2 320). If not, pad to the type's max within type.
@@ -319,10 +331,8 @@ def build_dataset(
         # without time can't be ordered).
         times.append(float(t) if isinstance(t, (int, float)) else float("nan"))
 
-    src = np.asarray(src)
-    dst = np.asarray(dst)
-    etypes = np.asarray(etypes)
-    times = np.asarray(times, dtype=np.float64)
+    src = np.asarray(src); dst = np.asarray(dst)
+    etypes = np.asarray(etypes); times = np.asarray(times, dtype=np.float64)
     keep = ~np.isnan(times)
     if not keep.all():
         print(f"[build_dataset] dropping {(~keep).sum()} edges with no `time`")
@@ -332,11 +342,9 @@ def build_dataset(
     if split == "temporal":
         sorted_steps = np.sort(np.unique(times))
         target = 1.0 - test_frac
-        cut_idx = int(
-            np.searchsorted(
-                np.array([(times <= s).mean() for s in sorted_steps]), target
-            )
-        )
+        cut_idx = int(np.searchsorted(
+            np.array([(times <= s).mean() for s in sorted_steps]), target
+        ))
         cut_idx = min(cut_idx, len(sorted_steps) - 1)
         cut_time = sorted_steps[cut_idx]
         train_mask_np = times <= cut_time
@@ -377,11 +385,9 @@ def build_dataset(
         test_mask_np = one_seen
         inductive_mask_np = neither_seen
         if neither_seen.any():
-            print(
-                f"[build_dataset] semi-inductive: {int(neither_seen.sum())} "
-                f"edges with both endpoints unseen are promoted to the "
-                f"inductive test set (no graph context — feature-only)."
-            )
+            print(f"[build_dataset] semi-inductive: {int(neither_seen.sum())} "
+                  f"edges with both endpoints unseen are promoted to the "
+                  f"inductive test set (no graph context — feature-only).")
 
     # Ordinal bins (always computed; the head may or may not use them).
     bins = None
@@ -389,7 +395,40 @@ def build_dataset(
         # Quantile binning on training-time values, then assign all edges.
         qs = np.linspace(0, 1, n_order_bins + 1)[1:-1]
         edges_q = np.quantile(times[train_mask_np], qs)
-        bins = np.digitize(times, edges_q)  # (E,) in [0, n_bins-1]
+        bins = np.digitize(times, edges_q)        # (E,) in [0, n_bins-1]
+
+    # Regression target for the order head. Three transforms, all map raw
+    # pathway-step times into [0, 1]; the regression head trains under MSE
+    # against this target.
+    #   min_max     — linear: (t - t_min) / (t_max - t_min). Default. Heavy
+    #                 tails (late steps with few events) get most of the
+    #                 weight on the high end.
+    #   log_min_max — apply log(1+t) first, then min-max. Compresses the
+    #                 tail; early dense region gets more weight.
+    #   rank        — rank-based: target = rank(t) / (N-1). Marginal
+    #                 distribution is uniform regardless of original shape.
+    #                 Useful if step-count distribution is highly skewed.
+    train_times = times[train_mask_np]
+    if time_target == "min_max":
+        t_min, t_max = float(times.min()), float(times.max())
+        span = max(t_max - t_min, 1.0)
+        order_target_np = ((times - t_min) / span).astype(np.float32)
+    elif time_target == "log_min_max":
+        log_t = np.log1p(times - times.min())  # shift to >= 0 first
+        t_min, t_max = float(log_t.min()), float(log_t.max())
+        span = max(t_max - t_min, 1.0)
+        order_target_np = ((log_t - t_min) / span).astype(np.float32)
+    elif time_target == "rank":
+        # rank(t) / (N-1), using the *all-edges* time ranking (so train and
+        # test see the same global ranking). argsort gives the inverse.
+        order_ranks = np.argsort(np.argsort(times))
+        denom = max(len(times) - 1, 1)
+        order_target_np = (order_ranks / denom).astype(np.float32)
+    else:
+        raise ValueError(
+            f"time_target must be 'min_max' | 'log_min_max' | 'rank', "
+            f"got {time_target!r}"
+        )
 
     # Build per-node compartment feature matrix from the parser-written
     # `cellularLocation` attribute. The attribute is a dict like
@@ -432,7 +471,11 @@ def build_dataset(
         for name in nodes:
             loc = G.nodes[name].get("cellularLocation")
             if isinstance(loc, dict):
-                key = loc.get("xref") or loc.get("common_name") or "_unknown_"
+                key = (
+                    loc.get("xref")
+                    or loc.get("common_name")
+                    or "_unknown_"
+                )
             else:
                 key = "_unknown_"
             if key not in compartment_vocab:
@@ -465,6 +508,7 @@ def build_dataset(
         test_mask=torch.from_numpy(test_mask_np),
         inductive_mask=torch.from_numpy(inductive_mask_np),
         order_bin=torch.from_numpy(bins.astype(np.int64)) if bins is not None else None,
+        order_target=torch.from_numpy(order_target_np),
         compartment_feat=compartment_feat_tensor,
         compartment_dim=compartment_feat_dim,
         compartment_vocab=compartment_vocab,
@@ -494,13 +538,13 @@ class FISHRGCN(nn.Module):
         dropout: float = 0.2,
         order_mode: str = "regression",
         n_order_bins: int = 20,
-        n_negatives: int = 20,
+        n_negatives: int = 5,
         time_encoding: bool = False,
         time_dim: int = 64,
         architecture: str = "rgcn",
         rgat_heads: int = 1,
         use_compartment: bool = False,
-        smart_negatives: bool = True,
+        smart_negatives: bool = False,
     ):
         super().__init__()
         if architecture not in ("rgcn", "rgat"):
@@ -543,24 +587,16 @@ class FISHRGCN(nn.Module):
         #   rgat / time    : RGATConv with edge_dim=time_dim (uses edge_attr)
         if architecture == "rgcn":
             if time_encoding:
-                self.convs = nn.ModuleList(
-                    [
-                        RGCNTimeConv(
-                            hidden,
-                            hidden,
-                            num_relations=data.n_edge_types,
-                            time_dim=time_dim,
-                        )
-                        for _ in range(n_layers)
-                    ]
-                )
+                self.convs = nn.ModuleList([
+                    RGCNTimeConv(hidden, hidden, num_relations=data.n_edge_types,
+                                 time_dim=time_dim)
+                    for _ in range(n_layers)
+                ])
             else:
-                self.convs = nn.ModuleList(
-                    [
-                        RGCNConv(hidden, hidden, num_relations=data.n_edge_types)
-                        for _ in range(n_layers)
-                    ]
-                )
+                self.convs = nn.ModuleList([
+                    RGCNConv(hidden, hidden, num_relations=data.n_edge_types)
+                    for _ in range(n_layers)
+                ])
         else:  # 'rgat'
             # Notes on the settings below:
             #   * dropout=0.0 inside RGATConv — that arg is *attention* dropout
@@ -573,50 +609,38 @@ class FISHRGCN(nn.Module):
             #     inflating the output dim.
             edge_dim_arg = time_dim if time_encoding else None
             effective_heads = max(rgat_heads, 4)
-            self.convs = nn.ModuleList(
-                [
-                    RGATConv(
-                        hidden,
-                        hidden,
-                        num_relations=data.n_edge_types,
-                        heads=effective_heads,
-                        concat=False,
-                        edge_dim=edge_dim_arg,
-                        dropout=0.0,
-                    )
-                    for _ in range(n_layers)
-                ]
-            )
+            self.convs = nn.ModuleList([
+                RGATConv(
+                    hidden, hidden,
+                    num_relations=data.n_edge_types,
+                    heads=effective_heads, concat=False,
+                    edge_dim=edge_dim_arg,
+                    dropout=0.0,
+                )
+                for _ in range(n_layers)
+            ])
         self.dropout = dropout
 
         # Three task heads, all operating on concat(h_u, h_v).
         head_in = 2 * hidden
         self.head_exist = nn.Sequential(
-            nn.Linear(head_in, hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, 1),
+            nn.Linear(head_in, hidden), nn.ReLU(),
+            nn.Dropout(dropout), nn.Linear(hidden, 1),
         )
         self.head_type = nn.Sequential(
-            nn.Linear(head_in, hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, data.n_edge_types),
+            nn.Linear(head_in, hidden), nn.ReLU(),
+            nn.Dropout(dropout), nn.Linear(hidden, data.n_edge_types),
         )
         if order_mode == "regression":
             self.head_order = nn.Sequential(
-                nn.Linear(head_in, hidden),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden, 1),
+                nn.Linear(head_in, hidden), nn.ReLU(),
+                nn.Dropout(dropout), nn.Linear(hidden, 1),
             )
         elif order_mode in ("corn", "coral"):
             # Both CORN and CORAL produce (K-1) ordinal binary outputs.
             self.head_order = nn.Sequential(
-                nn.Linear(head_in, hidden),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden, n_order_bins - 1),
+                nn.Linear(head_in, hidden), nn.ReLU(),
+                nn.Dropout(dropout), nn.Linear(hidden, n_order_bins - 1),
             )
         else:
             raise ValueError(
@@ -641,9 +665,7 @@ class FISHRGCN(nn.Module):
             if self.use_compartment:
                 # Gather the compartment rows for this type's nodes, in the
                 # same intra-type ordering as the feature matrix.
-                type_node_ids = (
-                    (data.node_type == ti).nonzero(as_tuple=False).squeeze(1)
-                )
+                type_node_ids = (data.node_type == ti).nonzero(as_tuple=False).squeeze(1)
                 # Sort by intra-type index so rows align with tensor.
                 order = data.node_intratype_idx[type_node_ids].argsort()
                 type_node_ids = type_node_ids[order]
@@ -657,7 +679,7 @@ class FISHRGCN(nn.Module):
             device=device,
         )
         for ti in range(data.n_node_types):
-            mask = data.node_type == ti
+            mask = (data.node_type == ti)
             if mask.any():
                 idx = data.node_intratype_idx[mask]
                 h[mask] = projected_per_type[ti][idx]
@@ -686,9 +708,8 @@ class FISHRGCN(nn.Module):
                 if self.time_encoding:
                     # RGATConv consumes edge features via the edge_attr arg
                     # when constructed with edge_dim=time_dim.
-                    h = conv(
-                        h, edge_index, edge_type=edge_type, edge_attr=edge_time_feat
-                    )
+                    h = conv(h, edge_index, edge_type=edge_type,
+                             edge_attr=edge_time_feat)
                 else:
                     h = conv(h, edge_index, edge_type=edge_type)
             h = F.relu(h)
@@ -713,9 +734,8 @@ class FISHRGCN(nn.Module):
 # ── training ────────────────────────────────────────────────────────────────
 
 
-def _sample_negatives(
-    data: FISHData, src: torch.Tensor, n_negatives: int, n_nodes: int, device
-) -> torch.Tensor:
+def _sample_negatives(data: FISHData, src: torch.Tensor, n_negatives: int,
+                      n_nodes: int, device) -> torch.Tensor:
     """Uniformly sample negative destination nodes for each src."""
     return torch.randint(0, n_nodes, (src.numel(), n_negatives), device=device)
 
@@ -745,20 +765,18 @@ def _build_train_negative_state(data: FISHData, device) -> dict:
     pool_tensor = torch.zeros((n_types, max_len), dtype=torch.long, device=device)
     pool_lens = torch.zeros(n_types, dtype=torch.long, device=device)
     for t, ids in enumerate(type_to_ids):
-        pool_tensor[t, : len(ids)] = torch.from_numpy(ids).to(device)
+        pool_tensor[t, :len(ids)] = torch.from_numpy(ids).to(device)
         pool_lens[t] = len(ids)
 
     return {
-        "pool_tensor": pool_tensor,  # (n_node_types, max_pool_size)
-        "pool_lens": pool_lens,  # (n_node_types,)
+        "pool_tensor": pool_tensor,   # (n_node_types, max_pool_size)
+        "pool_lens": pool_lens,        # (n_node_types,)
         "node_type": data.node_type.to(device),  # (N,)
     }
 
 
 def _sample_train_smart_negatives(
-    src: torch.Tensor,
-    dst: torch.Tensor,
-    train_neg_state: dict,
+    src: torch.Tensor, dst: torch.Tensor, train_neg_state: dict,
     n_negatives: int,
 ) -> torch.Tensor:
     """
@@ -773,13 +791,13 @@ def _sample_train_smart_negatives(
     in exchange for ~100x speedup over filtered sampling.
     """
     pool_tensor = train_neg_state["pool_tensor"]  # (n_types, max_len)
-    pool_lens = train_neg_state["pool_lens"]  # (n_types,)
-    node_type = train_neg_state["node_type"]  # (N,)
+    pool_lens = train_neg_state["pool_lens"]      # (n_types,)
+    node_type = train_neg_state["node_type"]       # (N,)
 
     n_pos = dst.numel()
     # For each positive, find v's node type and its pool length.
-    dst_types = node_type[dst]  # (n_pos,)
-    dst_pool_lens = pool_lens[dst_types]  # (n_pos,)
+    dst_types = node_type[dst]                     # (n_pos,)
+    dst_pool_lens = pool_lens[dst_types]            # (n_pos,)
 
     # Sample random indices in [0, pool_lens[type]) for each positive,
     # for each of n_negatives draws. Shape: (n_pos, n_negatives).
@@ -790,9 +808,9 @@ def _sample_train_smart_negatives(
     # Gather from the per-type pool. Need to expand dst_types for gathering.
     # pool_tensor[dst_types[i], sampled_idx[i, j]] -> negative id
     type_rep = dst_types.unsqueeze(1).expand(n_pos, n_negatives)  # (n_pos, n_neg)
-    flat_pool = pool_tensor.flatten()  # (n_types*max_len,)
-    flat_idx = type_rep * pool_tensor.shape[1] + sampled_idx  # global pool idx
-    neg_ids = flat_pool[flat_idx]  # (n_pos, n_neg)
+    flat_pool = pool_tensor.flatten()                              # (n_types*max_len,)
+    flat_idx = type_rep * pool_tensor.shape[1] + sampled_idx       # global pool idx
+    neg_ids = flat_pool[flat_idx]                                  # (n_pos, n_neg)
     return neg_ids
 
 
@@ -810,21 +828,15 @@ def train(
     model = model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # Pre-compute normalised times for regression head.
-    times = data.all_time
-    t_min, t_max = float(times.min()), float(times.max())
-    span = max(t_max - t_min, 1.0)
-    norm_time = ((times - t_min) / span).to(device)
+    # Regression target for the order head is precomputed in build_dataset
+    # under the chosen time_target transform (min_max | log_min_max | rank).
+    order_target_tr = data.order_target[data.train_mask].to(device)
 
     src_tr = data.all_src[data.train_mask].to(device)
     dst_tr = data.all_dst[data.train_mask].to(device)
     typ_tr = data.all_type[data.train_mask].to(device)
-    bin_tr = (
-        data.order_bin[data.train_mask].to(device)
-        if data.order_bin is not None
-        else None
-    )
-    norm_time_tr = norm_time[data.train_mask]
+    bin_tr = (data.order_bin[data.train_mask].to(device)
+              if data.order_bin is not None else None)
 
     # Precompute CORAL extended-binary levels once outside the training loop.
     # coral-pytorch's `levels_from_labelbatch` does a Python for-loop over
@@ -855,18 +867,11 @@ def train(
         pos_logit = model.existence_logit(h, src_tr, dst_tr)
         if model.smart_negatives and train_neg_state is not None:
             negs = _sample_train_smart_negatives(
-                src_tr,
-                dst_tr,
-                train_neg_state,
-                model.n_negatives,
+                src_tr, dst_tr, train_neg_state, model.n_negatives,
             )
         else:
             negs = _sample_negatives(
-                data,
-                src_tr,
-                model.n_negatives,
-                data.n_nodes,
-                device,
+                data, src_tr, model.n_negatives, data.n_nodes, device,
             )
         src_rep = src_tr.repeat_interleave(model.n_negatives)
         neg_logit = model.existence_logit(h, src_rep, negs.reshape(-1))
@@ -882,7 +887,7 @@ def train(
         # 3) Order: regression, CORN, or CORAL.
         out_order = model.order_output(h, src_tr, dst_tr)
         if model.order_mode == "regression":
-            loss_order = F.mse_loss(out_order.squeeze(-1), norm_time_tr)
+            loss_order = F.mse_loss(out_order.squeeze(-1), order_target_tr)
         elif model.order_mode == "corn":
             loss_order = _corn_loss(out_order, bin_tr, model.n_order_bins)
         else:  # 'coral'
@@ -951,13 +956,8 @@ def _build_negative_sampler_state(data: FISHData) -> dict:
 
 
 def _sample_smart_negatives(
-    src_np: np.ndarray,
-    dst_np: np.ndarray,
-    typ_np: np.ndarray,
-    state: dict,
-    n_neg_per_pos: int,
-    n_nodes: int,
-    rng: np.random.Generator,
+    src_np: np.ndarray, dst_np: np.ndarray, typ_np: np.ndarray,
+    state: dict, n_neg_per_pos: int, n_nodes: int, rng: np.random.Generator,
     node_type_of_dst: np.ndarray,
 ) -> np.ndarray:
     """
@@ -1056,10 +1056,10 @@ def _hits_at_k(
         # Expand src_h to (B, n_cand, hidden) and broadcast cand_h.
         src_exp = src_h.unsqueeze(1).expand(B, n_cand, src_h.shape[-1])
         cand_exp = cand_h.unsqueeze(0).expand(B, n_cand, cand_h.shape[-1])
-        pair = torch.cat([src_exp, cand_exp], dim=-1)  # (B, n_cand, 2H)
-        logits = model.head_exist(pair).squeeze(-1)  # (B, n_cand)
+        pair = torch.cat([src_exp, cand_exp], dim=-1)        # (B, n_cand, 2H)
+        logits = model.head_exist(pair).squeeze(-1)          # (B, n_cand)
 
-        dst_cols = cand_to_col[sub_dst]  # (B,), -1 where dst isn't in pool
+        dst_cols = cand_to_col[sub_dst]      # (B,), -1 where dst isn't in pool
         valid = dst_cols >= 0
         if not valid.any():
             continue
@@ -1083,13 +1083,8 @@ def _hits_at_k(
 
 
 def _score_edge_set(
-    model: FISHRGCN,
-    data: FISHData,
-    h: torch.Tensor,
-    mask: torch.Tensor,
-    n_neg_per_pos: int,
-    device,
-    seed: int,
+    model: FISHRGCN, data: FISHData, h: torch.Tensor, mask: torch.Tensor,
+    n_neg_per_pos: int, device, seed: int,
     neg_state: Optional[dict] = None,
     compute_hits: bool = False,
     hits_ks: tuple[int, ...] = (1, 10, 100),
@@ -1113,8 +1108,8 @@ def _score_edge_set(
     Type and order use positive edges only and are unaffected by the
     negative-sampling or hits choices.
     """
-    from scipy.stats import spearmanr
     from sklearn.metrics import roc_auc_score
+    from scipy.stats import spearmanr
 
     if int(mask.sum()) == 0:
         empty = {
@@ -1145,15 +1140,12 @@ def _score_edge_set(
     g = torch.Generator(device=device).manual_seed(seed)
     pos_logit = model.existence_logit(h, src, dst)
     src_rep = src.repeat_interleave(n_neg_per_pos)
-    neg_dst_random = torch.randint(
-        0, data.n_nodes, (src.numel() * n_neg_per_pos,), generator=g, device=device
-    )
+    neg_dst_random = torch.randint(0, data.n_nodes, (src.numel() * n_neg_per_pos,),
+                                   generator=g, device=device)
     neg_logit_random = model.existence_logit(h, src_rep, neg_dst_random)
-    y_true_r = (
-        torch.cat([torch.ones_like(pos_logit), torch.zeros_like(neg_logit_random)])
-        .cpu()
-        .numpy()
-    )
+    y_true_r = torch.cat(
+        [torch.ones_like(pos_logit), torch.zeros_like(neg_logit_random)]
+    ).cpu().numpy()
     y_score_r = torch.cat([pos_logit, neg_logit_random]).cpu().numpy()
     exist_auc = float(roc_auc_score(y_true_r, y_score_r))
 
@@ -1163,22 +1155,15 @@ def _score_edge_set(
         rng = np.random.default_rng(seed + 12345)
         node_type_np = data.node_type.cpu().numpy()
         smart_neg_np = _sample_smart_negatives(
-            src.cpu().numpy(),
-            dst.cpu().numpy(),
-            typ.cpu().numpy(),
-            neg_state,
-            n_neg_per_pos,
-            data.n_nodes,
-            rng,
+            src.cpu().numpy(), dst.cpu().numpy(), typ.cpu().numpy(),
+            neg_state, n_neg_per_pos, data.n_nodes, rng,
             node_type_of_dst=node_type_np,
         )
         smart_neg = torch.from_numpy(smart_neg_np).to(device).reshape(-1)
         neg_logit_smart = model.existence_logit(h, src_rep, smart_neg)
-        y_true_s = (
-            torch.cat([torch.ones_like(pos_logit), torch.zeros_like(neg_logit_smart)])
-            .cpu()
-            .numpy()
-        )
+        y_true_s = torch.cat(
+            [torch.ones_like(pos_logit), torch.zeros_like(neg_logit_smart)]
+        ).cpu().numpy()
         y_score_s = torch.cat([pos_logit, neg_logit_smart]).cpu().numpy()
         exist_auc_smart = float(roc_auc_score(y_true_s, y_score_s))
 
@@ -1192,9 +1177,9 @@ def _score_edge_set(
         try:
             sub_logits = type_logits[:, present_classes]
             oh = (type_true[:, None] == present_classes[None, :]).astype(int)
-            type_auc = float(
-                roc_auc_score(oh, sub_logits, average="macro", multi_class="ovr")
-            )
+            type_auc = float(roc_auc_score(
+                oh, sub_logits, average="macro", multi_class="ovr"
+            ))
             type_auc_classes_used = [int(c) for c in present_classes]
         except ValueError:
             type_auc = float("nan")
@@ -1240,11 +1225,7 @@ def _score_edge_set(
     if compute_hits and src.numel() > 0:
         all_candidates = torch.arange(data.n_nodes, device=device)
         hits_all = _hits_at_k(
-            model,
-            h,
-            src,
-            dst,
-            all_candidates,
+            model, h, src, dst, all_candidates,
             n_nodes_total=data.n_nodes,
             ks=hits_ks,
         )
@@ -1265,11 +1246,7 @@ def _score_edge_set(
             sub_dst = dst[torch.from_numpy(mask_t)].to(device)
             pool = torch.from_numpy(ids_of_type.astype(np.int64)).to(device)
             sub_hits = _hits_at_k(
-                model,
-                h,
-                sub_src,
-                sub_dst,
-                pool,
+                model, h, sub_src, sub_dst, pool,
                 n_nodes_total=data.n_nodes,
                 ks=hits_ks,
             )
@@ -1278,9 +1255,8 @@ def _score_edge_set(
                 per_type_accum[key] += frac * n_sub
             per_type_total += n_sub
         if per_type_total:
-            hits_type = {
-                key: per_type_accum[key] / per_type_total for key in per_type_accum
-            }
+            hits_type = {key: per_type_accum[key] / per_type_total
+                         for key in per_type_accum}
 
     out = {
         "exist_auc": exist_auc,
@@ -1305,11 +1281,8 @@ def _score_edge_set(
 
 
 def evaluate(
-    model: FISHRGCN,
-    data: FISHData,
-    n_neg_per_pos: int = 20,
-    device: Optional[str] = None,
-    seed: int = 0,
+    model: FISHRGCN, data: FISHData, n_neg_per_pos: int = 20,
+    device: Optional[str] = None, seed: int = 0,
     compute_hits: bool = False,
     hits_ks: tuple[int, ...] = (1, 10, 100),
     hits_batch: int = 2048,
@@ -1328,11 +1301,7 @@ def evaluate(
     """
     with torch.no_grad():
         return _evaluate_impl(
-            model,
-            data,
-            n_neg_per_pos,
-            device,
-            seed,
+            model, data, n_neg_per_pos, device, seed,
             compute_hits=compute_hits,
             hits_ks=hits_ks,
             hits_batch=hits_batch,
@@ -1340,11 +1309,8 @@ def evaluate(
 
 
 def _evaluate_impl(
-    model: FISHRGCN,
-    data: FISHData,
-    n_neg_per_pos: int,
-    device: Optional[str],
-    seed: int,
+    model: FISHRGCN, data: FISHData, n_neg_per_pos: int,
+    device: Optional[str], seed: int,
     compute_hits: bool,
     hits_ks: tuple[int, ...],
     hits_batch: int,
@@ -1358,17 +1324,9 @@ def _evaluate_impl(
 
     # Primary: semi-inductive (bridge) test set.
     primary = _score_edge_set(
-        model,
-        data,
-        h,
-        data.test_mask,
-        n_neg_per_pos,
-        device,
-        seed,
+        model, data, h, data.test_mask, n_neg_per_pos, device, seed,
         neg_state=neg_state,
-        compute_hits=compute_hits,
-        hits_ks=hits_ks,
-        hits_batch=hits_batch,
+        compute_hits=compute_hits, hits_ks=hits_ks, hits_batch=hits_batch,
     )
     out: dict = dict(primary)
     out["n_test_edges"] = primary["n_edges"]
@@ -1376,17 +1334,9 @@ def _evaluate_impl(
     # Secondary: inductive (both-unseen) test set, when present.
     if data.inductive_mask is not None and int(data.inductive_mask.sum()) > 0:
         inductive = _score_edge_set(
-            model,
-            data,
-            h,
-            data.inductive_mask,
-            n_neg_per_pos,
-            device,
-            seed + 1,
+            model, data, h, data.inductive_mask, n_neg_per_pos, device, seed + 1,
             neg_state=neg_state,
-            compute_hits=compute_hits,
-            hits_ks=hits_ks,
-            hits_batch=hits_batch,
+            compute_hits=compute_hits, hits_ks=hits_ks, hits_batch=hits_batch,
         )
         for k, v in inductive.items():
             out[f"ind_{k}"] = v
@@ -1402,12 +1352,10 @@ def _evaluate_impl(
     seen_nodes |= set(data.all_dst[data.train_mask].cpu().numpy().tolist())
     src_np = data.all_src[data.test_mask].cpu().numpy()
     dst_np = data.all_dst[data.test_mask].cpu().numpy()
-    both_seen = sum(
-        1 for s, d in zip(src_np, dst_np) if s in seen_nodes and d in seen_nodes
-    )
-    one_seen = sum(
-        1 for s, d in zip(src_np, dst_np) if (s in seen_nodes) != (d in seen_nodes)
-    )
+    both_seen = sum(1 for s, d in zip(src_np, dst_np)
+                    if s in seen_nodes and d in seen_nodes)
+    one_seen = sum(1 for s, d in zip(src_np, dst_np)
+                   if (s in seen_nodes) != (d in seen_nodes))
     neither_seen = len(src_np) - both_seen - one_seen
     out["test_both_endpoints_seen"] = both_seen
     out["test_one_endpoint_seen"] = one_seen
