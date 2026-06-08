@@ -11,8 +11,7 @@ Fast (no network, run every time):
 Network / slow (skipped unless --run-network is passed):
   TestDownload       — downloads a tiny pathway file from Reactome.
   TestDownloadParse  — downloads the Immune pathway (R-HSA-168256, ~42 MB) and
-                       parses it end-to-end; matches the benchmark described in
-                       baselines/GNNs/README.md.
+                       parses it end-to-end.
 
 Run the fast suite:
     pytest tests/test_download_and_parse.py -v
