@@ -379,6 +379,12 @@ def main():
     parser.add_argument("--out-json", default="results.json")
     parser.add_argument("--out-csv", default="results.csv")
     parser.add_argument(
+        "--tune-json", default="best_params.json",
+        help="Path to best_params.json written by tune.py. If the file exists, "
+             "tuned hyperparameters are loaded automatically. Any param explicitly "
+             "passed on the CLI takes precedence over the JSON value."
+    )
+    parser.add_argument(
         "--compartment-embeddings", default=None,
         help="Path to a .npz/.pkl/.tsv of compartment embeddings (e.g. GO2Vec). "
              "When provided, conditions with use_compartment=True use these "
@@ -386,6 +392,33 @@ def main():
              "instead — equivalent to a learned embedding via the input projection."
     )
     args = parser.parse_args()
+
+    # Auto-load tuned hyperparameters from best_params.json if it exists.
+    # CLI flags take precedence: a param is only overridden when the user left
+    # it at its argparse default (i.e. didn't explicitly pass it on the CLI).
+    _tune_map = {
+        "hidden": "hidden",
+        "n_layers": "n_layers",
+        "lr": "lr",
+        "dropout": "dropout",
+        "order_weight": "order_weight",
+        "time_target": "time_target",
+        "epochs": "epochs",
+    }
+    import json as _json
+    from pathlib import Path as _Path
+    _tune_path = _Path(args.tune_json)
+    if _tune_path.exists():
+        _tuned = _json.loads(_tune_path.read_text()).get("best_params", {})
+        _overridden = []
+        for _jkey, _dest in _tune_map.items():
+            if _jkey in _tuned and getattr(args, _dest) == parser.get_default(_dest):
+                setattr(args, _dest, _tuned[_jkey])
+                _overridden.append(f"{_dest}={_tuned[_jkey]}")
+        if _overridden:
+            print(f"[main] Loaded from {_tune_path}: {', '.join(_overridden)}")
+    elif args.tune_json != "best_params.json":
+        parser.error(f"--tune-json file not found: {args.tune_json}")
 
     # Resolve device: explicit --device wins; then --gpu / --cpu shortcuts;
     # otherwise auto-detect (CUDA > MPS > CPU).
