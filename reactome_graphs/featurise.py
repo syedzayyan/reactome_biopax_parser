@@ -665,10 +665,19 @@ class NodeFeaturiser:
         device = self.protein_model_device
         model = model.to(device)
 
+        try:
+            from tqdm import tqdm as _tqdm
+        except ImportError:
+            _tqdm = None
+
         results = {}
         items = list(protein_seqs.items())
+        n_batches = (len(items) + 31) // 32
+        batch_iter = range(0, len(items), 32)
+        if _tqdm is not None:
+            batch_iter = _tqdm(batch_iter, total=n_batches, desc="[ESM] Embedding", unit="batch")
 
-        for i in range(0, len(items), 32):
+        for i in batch_iter:
             batch = items[i : i + 32]
             nodes, seqs = zip(*batch)
             seqs_truncated = [s[:1022] for s in seqs]
