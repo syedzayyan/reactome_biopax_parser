@@ -635,7 +635,13 @@ class _ParserBase:
         self._log("info", f"Parsed {len(self.reactionOrder)} pathway steps")
 
         # ---- per-pathway traversal: assign (pathway_id, local_order) to each step ----
-        from collections import deque
+        # local_order is the topological depth in the nextStep DAG:
+        #   - all roots (no incoming nextStep within this pathway) get depth 0
+        #   - each successor gets depth = max(predecessor depths) + 1
+        # This means genuinely parallel reactions share the same depth and are
+        # never falsely ordered relative to each other, unlike BFS queue order
+        # which assigned different positions to parallel roots arbitrarily.
+        from collections import defaultdict, deque
 
         self.step_order = {}  # stepID -> (pathway_id, local_index)
 
@@ -644,41 +650,42 @@ class _ParserBase:
             if not step_set:
                 continue
 
-            # Find roots: steps in this pathway that no other step in this pathway
-            # points to via nextStep.
-            incoming = set()
+            # Build next-step adjacency and track in-degree within this pathway.
+            successors: dict[str, list[str]] = defaultdict(list)
+            in_degree: dict[str, int] = defaultdict(int)
             for sid in step_ids:
                 if sid not in self.reactionOrder:
                     continue
                 _, next_steps = self.reactionOrder[sid]
                 for ns in next_steps:
                     if ns in step_set:
-                        incoming.add(ns)
-            roots = [s for s in step_ids if s not in incoming]
+                        successors[sid].append(ns)
+                        in_degree[ns] += 1
 
-            # BFS from roots, assign local order in traversal sequence.
-            visited = set()
-            order_idx = 0
+            roots = [s for s in step_ids if in_degree[s] == 0]
+
+            # Topological depth: propagate max(predecessor depth) + 1.
+            # All roots start at depth 0. A node is enqueued only once all its
+            # predecessors have been assigned a depth (Kahn's algorithm).
+            depth: dict[str, int] = {r: 0 for r in roots}
+            remaining_in = dict(in_degree)
             queue = deque(roots)
             while queue:
                 sid = queue.popleft()
-                if sid in visited or sid not in step_set:
-                    continue
-                visited.add(sid)
-                self.step_order[sid] = (pid, order_idx)
-                order_idx += 1
-                if sid in self.reactionOrder:
-                    _, next_steps = self.reactionOrder[sid]
-                    for ns in next_steps:
-                        if ns in step_set and ns not in visited:
-                            queue.append(ns)
+                for ns in successors[sid]:
+                    # Update successor depth to max(current, parent+1).
+                    depth[ns] = max(depth.get(ns, 0), depth[sid] + 1)
+                    remaining_in[ns] -= 1
+                    if remaining_in[ns] == 0:
+                        queue.append(ns)
 
-            # Cycle safety: steps in cycles with no roots won't be reached by BFS.
+            # Assign step_order from depth; steps unreachable from any root
+            # (cycle members) fall back to max_depth + 1 so they sort last.
+            max_depth = max(depth.values()) if depth else 0
             for sid in step_ids:
-                if sid in step_set and sid not in visited:
-                    visited.add(sid)
-                    self.step_order[sid] = (pid, order_idx)
-                    order_idx += 1
+                if sid not in depth:
+                    depth[sid] = max_depth + 1
+                self.step_order[sid] = (pid, depth[sid])
 
     def __parse_reactions(self):
         reactions_list = list(
