@@ -74,7 +74,7 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def load_graph(args):
+def load_graph(args, esm_device: str = "cpu"):
     if args.pickle:
         import pickle
         with open(args.pickle, "rb") as fh:
@@ -84,7 +84,8 @@ def load_graph(args):
     G = parser.parse_biopax_into_networkx(
         args.biopax, reaction_partners=False, include_complexes=True,
     )
-    featuriser = NodeFeaturiser(G, xref_dict={}, parser=parser)
+    featuriser = NodeFeaturiser(G, xref_dict={}, parser=parser,
+                                protein_model_device=esm_device)
     featuriser.download_and_store()
     featuriser.featurise()
     return G
@@ -245,7 +246,7 @@ def main():
 
     # Load graph once and reuse across trials.
     print(f"[tune] Loading {args.pathway_name}")
-    G = load_graph(args)
+    G = load_graph(args, esm_device=device)
     print(f"[tune] Graph: {G.number_of_nodes()} nodes, "
           f"{G.number_of_edges()} edges")
     print(f"[tune] Running {args.n_trials} trials. Epochs is tuned per trial "

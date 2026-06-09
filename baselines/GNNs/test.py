@@ -99,7 +99,12 @@ CONDITIONS = _make_conditions()
 # ── pathway loading ─────────────────────────────────────────────────────────
 
 
-def load_and_featurise(biopax_path: str, reaction_partners: bool, include_complexes: bool):
+def load_and_featurise(
+    biopax_path: str,
+    reaction_partners: bool,
+    include_complexes: bool,
+    esm_device: str = "cpu",
+):
     """
     Parse and featurise once. Returns the prepared networkx graph.
 
@@ -115,7 +120,8 @@ def load_and_featurise(biopax_path: str, reaction_partners: bool, include_comple
         reaction_partners=reaction_partners,
         include_complexes=include_complexes,
     )
-    featuriser = NodeFeaturiser(G, xref_dict={}, parser=parser)
+    featuriser = NodeFeaturiser(G, xref_dict={}, parser=parser,
+                                protein_model_device=esm_device)
     featuriser.download_and_store()
     featuriser.featurise()
     return G
@@ -413,6 +419,7 @@ def main():
             args.biopax,
             reaction_partners=args.reaction_partners,
             include_complexes=not args.no_complexes,
+            esm_device=device,
         )
     else:
         G = load_pickled_graph(args.pickle)

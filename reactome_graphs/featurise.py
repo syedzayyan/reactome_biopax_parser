@@ -660,25 +660,32 @@ class NodeFeaturiser:
         model_name = self.protein_model_path or self.protein_model_name
         print(f"[ESM] Loading ESM-2 model ({model_name})...")
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = EsmModel.from_pretrained(model_name)
-        model.eval()
         device = self.protein_model_device
+        use_fp16 = device != "cpu" and torch.cuda.is_available()
+        dtype = torch.float16 if use_fp16 else torch.float32
+        model = EsmModel.from_pretrained(model_name, torch_dtype=dtype)
+        model.eval()
         model = model.to(device)
+        if use_fp16:
+            print(f"[ESM] Running fp16 on {device}")
 
         try:
             from tqdm import tqdm as _tqdm
         except ImportError:
             _tqdm = None
 
-        results = {}
-        items = list(protein_seqs.items())
-        n_batches = (len(items) + 31) // 32
-        batch_iter = range(0, len(items), 32)
+        # Sort by length so each batch has similar-length sequences,
+        # minimising wasted padding computation.
+        items = sorted(protein_seqs.items(), key=lambda kv: len(kv[1]))
+        batch_size = 64 if use_fp16 else 32
+        n_batches = (len(items) + batch_size - 1) // batch_size
+        batch_iter = range(0, len(items), batch_size)
         if _tqdm is not None:
             batch_iter = _tqdm(batch_iter, total=n_batches, desc="[ESM] Embedding", unit="batch")
 
+        results = {}
         for i in batch_iter:
-            batch = items[i : i + 32]
+            batch = items[i : i + batch_size]
             nodes, seqs = zip(*batch)
             seqs_truncated = [s[:1022] for s in seqs]
 
@@ -694,7 +701,7 @@ class NodeFeaturiser:
             with torch.no_grad():
                 out = model(**tokens)
 
-            hidden = out.last_hidden_state  # [B, L, D]
+            hidden = out.last_hidden_state.float()  # cast back to fp32 for numpy
             attention_mask = tokens["attention_mask"]  # [B, L]
 
             for j, node in enumerate(nodes):
