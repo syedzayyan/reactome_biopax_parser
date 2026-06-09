@@ -19,7 +19,7 @@ class NodeFeaturiser:
         cache_dir: str = ".cache/node_featuriser",
         fingerprinter="morgan",
         embed_dim: int = 128,
-        protein_model_name: str = "facebook/esm2_t6_8M_UR50D",
+        protein_model_name: str = "facebook/esm2_t33_650M_UR50D",
         protein_model_path=None,
         protein_model_device: str = "cpu",
         edge_types: list[str] | None = None,

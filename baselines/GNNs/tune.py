@@ -251,6 +251,7 @@ def main():
     print(f"[tune] Running {args.n_trials} trials. Epochs is tuned per trial "
           f"(choices: 50/100/200/400).")
 
+    optuna.logging.set_verbosity(optuna.logging.INFO)
     sampler = optuna.samplers.TPESampler(seed=0)
     study = optuna.create_study(
         direction="maximize",
