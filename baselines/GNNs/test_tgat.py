@@ -287,7 +287,35 @@ def main():
     parser.add_argument("--out-json", default="results_tgat.json")
     parser.add_argument("--out-csv", default="results_tgat.csv")
     parser.add_argument("--compartment-embeddings", default=None)
+    parser.add_argument(
+        "--tune-json", default="best_params_tgat.json",
+        help="Path to best_params_tgat.json written by tune_tgat.py. Loaded "
+             "automatically if the file exists; CLI flags take precedence.",
+    )
     args = parser.parse_args()
+
+    # Auto-load tuned hyperparameters; CLI flags win over JSON values.
+    _tune_map = {
+        "hidden": "hidden", "n_layers": "n_layers", "n_heads": "n_heads",
+        "lr": "lr", "dropout": "dropout", "time_dim": "time_dim",
+        "edge_feat_dim": "edge_feat_dim", "max_neighbors": "max_neighbors",
+        "order_weight": "order_weight", "time_target": "time_target",
+        "epochs": "epochs",
+    }
+    import json as _json
+    from pathlib import Path as _Path
+    _tune_path = _Path(args.tune_json)
+    if _tune_path.exists():
+        _tuned = _json.loads(_tune_path.read_text()).get("best_params", {})
+        _overridden = []
+        for _jkey, _dest in _tune_map.items():
+            if _jkey in _tuned and getattr(args, _dest) == parser.get_default(_dest):
+                setattr(args, _dest, _tuned[_jkey])
+                _overridden.append(f"{_dest}={_tuned[_jkey]}")
+        if _overridden:
+            print(f"[main] Loaded from {_tune_path}: {', '.join(_overridden)}")
+    elif args.tune_json != "best_params_tgat.json":
+        parser.error(f"--tune-json file not found: {args.tune_json}")
 
     if args.gpu and args.cpu:
         parser.error("Cannot pass --gpu and --cpu together.")
