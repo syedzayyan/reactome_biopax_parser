@@ -40,7 +40,7 @@ Usage
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -1089,6 +1089,7 @@ def _score_edge_set(
     compute_hits: bool = False,
     hits_ks: tuple[int, ...] = (1, 10, 100),
     hits_batch: int = 2048,
+    hits_fn: Optional[Callable] = None,
 ) -> dict:
     """
     Compute the three task metrics on the edges selected by ``mask``.
@@ -1105,11 +1106,19 @@ def _score_edge_set(
     in the top K. Expensive (~5000 positives x 7000 candidates) so it's
     off by default.
 
+    ``hits_fn`` overrides the Hits@K implementation (default ``_hits_at_k``,
+    which assumes ``h`` is a (N, hidden) per-node embedding table). Models
+    whose ``existence_logit`` doesn't follow that contract — e.g. FISHSTHN,
+    which scores each (src, dst) query via its own subgraph — pass a
+    compatible replacement with the same signature as ``_hits_at_k``.
+
     Type and order use positive edges only and are unaffected by the
     negative-sampling or hits choices.
     """
     from sklearn.metrics import roc_auc_score
     from scipy.stats import spearmanr
+
+    hits_fn = hits_fn or _hits_at_k
 
     if int(mask.sum()) == 0:
         empty = {
@@ -1224,7 +1233,7 @@ def _score_edge_set(
     hits_type["mrr"] = float("nan")
     if compute_hits and src.numel() > 0:
         all_candidates = torch.arange(data.n_nodes, device=device)
-        hits_all = _hits_at_k(
+        hits_all = hits_fn(
             model, h, src, dst, all_candidates,
             n_nodes_total=data.n_nodes,
             ks=hits_ks,
@@ -1245,7 +1254,7 @@ def _score_edge_set(
             sub_src = src[torch.from_numpy(mask_t)].to(device)
             sub_dst = dst[torch.from_numpy(mask_t)].to(device)
             pool = torch.from_numpy(ids_of_type.astype(np.int64)).to(device)
-            sub_hits = _hits_at_k(
+            sub_hits = hits_fn(
                 model, h, sub_src, sub_dst, pool,
                 n_nodes_total=data.n_nodes,
                 ks=hits_ks,
@@ -1314,6 +1323,7 @@ def _evaluate_impl(
     compute_hits: bool,
     hits_ks: tuple[int, ...],
     hits_batch: int,
+    hits_fn: Optional[Callable] = None,
 ) -> dict:
     device = device or next(model.parameters()).device
     model.eval()
@@ -1327,6 +1337,7 @@ def _evaluate_impl(
         model, data, h, data.test_mask, n_neg_per_pos, device, seed,
         neg_state=neg_state,
         compute_hits=compute_hits, hits_ks=hits_ks, hits_batch=hits_batch,
+        hits_fn=hits_fn,
     )
     out: dict = dict(primary)
     out["n_test_edges"] = primary["n_edges"]
@@ -1337,6 +1348,7 @@ def _evaluate_impl(
             model, data, h, data.inductive_mask, n_neg_per_pos, device, seed + 1,
             neg_state=neg_state,
             compute_hits=compute_hits, hits_ks=hits_ks, hits_batch=hits_batch,
+            hits_fn=hits_fn,
         )
         for k, v in inductive.items():
             out[f"ind_{k}"] = v
