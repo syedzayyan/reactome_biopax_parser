@@ -10,7 +10,7 @@ lib/
 
 *.ipynb
 *.txt
-*.sh
+
 
 tpnet/
 STHN/
@@ -21,6 +21,7 @@ tgat/
 modules/
 cache/
 .cache/
+cached_graphs/
 go.obo
 go_node2vec_embeddings.pt
 go_node2vec_matrix.pt
