@@ -131,13 +131,29 @@ def make_objective(G, args, device):
         # CORAL loss scale fix (same as RGCN/TGAT tuners).
         loss_weights = (1.0, 1.0, order_weight / 20.0)
 
-        train(model, data,
-              epochs=trial_epochs, lr=lr,
-              loss_weights=loss_weights,
-              device=device, log_every=trial_epochs)
+        try:
+            train(model, data,
+                  epochs=trial_epochs, lr=lr,
+                  loss_weights=loss_weights,
+                  device=device, log_every=trial_epochs)
 
-        m = evaluate(model, data, device=device, seed=fixed_seed,
-                     compute_hits=True)
+            m = evaluate(model, data, device=device, seed=fixed_seed,
+                         compute_hits=True)
+        except torch.cuda.OutOfMemoryError:
+            # The mixer encodes every (src, dst) pair + its 20 negatives as a
+            # full sequence through a Transformer in one un-batched call, so
+            # large hidden/window_size combos can exceed GPU memory on bigger
+            # pathways. Report a score worse than any real trial so TPE learns
+            # to steer away from this region instead of treating it as a
+            # no-information gap (the default behaviour when an exception
+            # just propagates up to optuna's catch=(Exception,)).
+            print(f"  -> OOM with hidden={hidden}, n_layers={n_layers}, "
+                  f"window_size={window_size}, channel_expansion_factor="
+                  f"{channel_expansion_factor}; scoring as failed.", flush=True)
+            del model, data
+            torch.cuda.empty_cache()
+            return -1.0
+
         score = multi_task_score(m)
 
         print(
