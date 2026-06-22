@@ -62,6 +62,17 @@ from coral_pytorch.losses import corn_loss as _corn_loss
 from coral_pytorch.losses import coral_loss as _coral_loss
 from coral_pytorch.dataset import corn_label_from_logits as _corn_label_from_logits
 
+try:
+    # The memory-efficient SDPA backend caps batch*heads at 65535 and can't
+    # save dropout RNG state above that, which the mixer's batched (all
+    # pairs + negatives in one forward pass) attention call easily exceeds
+    # on larger pathways. Restrict to flash/math, which have no such cap.
+    from torch.nn.attention import sdpa_kernel as _sdpa_kernel, SDPBackend as _SDPBackend
+    def _mixer_attention_backend():
+        return _sdpa_kernel([_SDPBackend.FLASH_ATTENTION, _SDPBackend.MATH])
+except ImportError:
+    from contextlib import nullcontext as _mixer_attention_backend
+
 # Shared data structures and evaluation helpers from the RGCN baseline.
 # FISHData and build_dataset are re-exported so callers only need fish_sthn.
 from fish_rgcn import (
@@ -215,8 +226,9 @@ class _PatchMixer(nn.Module):
         x = edge_repr.reshape(B, self.n_windows, self.window_size * H)
         x = self.pad_projector(x)
         x = x + self.pos_emb
-        for layer in self.layers:
-            x = layer(x)
+        with _mixer_attention_backend():
+            for layer in self.layers:
+                x = layer(x)
         x = self.layernorm(x)
         return x.mean(dim=1)  # (B, hidden)
 
