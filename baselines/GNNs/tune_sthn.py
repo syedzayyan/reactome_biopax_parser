@@ -127,6 +127,7 @@ def make_objective(G, args, device):
             n_negatives=20,
             use_compartment=True,
             smart_negatives=False,
+            use_time_encoding=True,
         )
         # CORAL loss scale fix (same as RGCN/TGAT tuners).
         loss_weights = (1.0, 1.0, order_weight / 20.0)

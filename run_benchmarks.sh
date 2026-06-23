@@ -116,6 +116,13 @@
 #   --use-attention       (HGCN only) Use the attention variant of
 #                         HypergraphConv. Off by default.
 #
+#   --time-ablation       (STHN only) Also run the no-time-encoding variants
+#                         (Time2Vec dropped from the subgraph mixer), mirroring
+#                         RGCN's time ablation. Default: time-encoding always
+#                         on, 6 conditions. With --time-ablation: 12 conditions,
+#                         ~2x STHN runtime. Tuning is unaffected (always tunes
+#                         the +time headline condition).
+#
 #   --storage URL         Optuna storage URL shared by all tuners.
 #                         Default: sqlite:///optuna_studies.db (in --out-dir).
 
@@ -155,6 +162,7 @@ MAX_EDGES=20
 WINDOW_SIZE=5
 CHANNEL_EXPANSION_FACTOR=2
 USE_ATTENTION=false
+TIME_ABLATION=false
 STORAGE=""            # resolved to file inside OUT_DIR after parsing
 
 # ── argument parsing ──────────────────────────────────────────────────────────
@@ -192,6 +200,7 @@ while [[ $# -gt 0 ]]; do
         --window-size)       WINDOW_SIZE="$2";                      shift 2 ;;
         --channel-expansion-factor) CHANNEL_EXPANSION_FACTOR="$2";  shift 2 ;;
         --use-attention)     USE_ATTENTION=true;                    shift   ;;
+        --time-ablation)     TIME_ABLATION=true;                    shift   ;;
         --storage)           STORAGE="$2";                          shift 2 ;;
         -h|--help)
             grep '^#' "$0" | grep -v '#!/' | sed 's/^# \?//'
@@ -253,31 +262,35 @@ mkdir -p "$ABS_OUT_DIR"
 # Optuna storage lives inside ABS_OUT_DIR unless the caller set --storage.
 [[ -z "$STORAGE" ]] && STORAGE="sqlite:///${ABS_OUT_DIR}/optuna_studies.db"
 
-# Input graph argument — always absolute.
+# Input graph argument — always absolute. Built as an array (not a string)
+# so values containing spaces (e.g. --pathway-name "Cell Cycle") survive
+# intact instead of being word-split when expanded below.
 if [[ -n "$PICKLE" ]]; then
-    [[ "$PICKLE" = /* ]] && INPUT_ARG="--pickle $PICKLE" \
-                         || INPUT_ARG="--pickle ${REPO_ROOT}/${PICKLE}"
+    [[ "$PICKLE" = /* ]] && ABS_INPUT="$PICKLE" || ABS_INPUT="${REPO_ROOT}/${PICKLE}"
+    INPUT_ARG=(--pickle "$ABS_INPUT")
 else
-    [[ "$BIOPAX" = /* ]] && INPUT_ARG="--biopax $BIOPAX" \
-                         || INPUT_ARG="--biopax ${REPO_ROOT}/${BIOPAX}"
+    [[ "$BIOPAX" = /* ]] && ABS_INPUT="$BIOPAX" || ABS_INPUT="${REPO_ROOT}/${BIOPAX}"
+    INPUT_ARG=(--biopax "$ABS_INPUT")
 fi
 
 cd "$SCRIPT_DIR"
 
 # Optional flags shared by all scripts
-COMMON_OPTS="--pathway-name $PATHWAY_NAME"
-COMMON_OPTS+=" --epochs $EPOCHS --seeds $SEEDS"
-COMMON_OPTS+=" --hidden $HIDDEN --n-layers $N_LAYERS"
-COMMON_OPTS+=" --lr $LR --dropout $DROPOUT"
-COMMON_OPTS+=" --n-negatives $N_NEGATIVES --order-weight $ORDER_WEIGHT"
-COMMON_OPTS+=" --time-target $TIME_TARGET"
-[[ -n "$DEVICE_FLAG" ]] && COMMON_OPTS+=" $DEVICE_FLAG"
-[[ -n "$COMPARTMENT_EMB" ]] && COMMON_OPTS+=" --compartment-embeddings $COMPARTMENT_EMB"
-$HITS        && COMMON_OPTS+=" --hits"
-$SMART_TRAIN && COMMON_OPTS+=" --smart-train"
+COMMON_OPTS=(
+    --pathway-name "$PATHWAY_NAME"
+    --epochs "$EPOCHS" --seeds "$SEEDS"
+    --hidden "$HIDDEN" --n-layers "$N_LAYERS"
+    --lr "$LR" --dropout "$DROPOUT"
+    --n-negatives "$N_NEGATIVES" --order-weight "$ORDER_WEIGHT"
+    --time-target "$TIME_TARGET"
+)
+[[ -n "$DEVICE_FLAG" ]] && COMMON_OPTS+=("$DEVICE_FLAG")
+[[ -n "$COMPARTMENT_EMB" ]] && COMMON_OPTS+=(--compartment-embeddings "$COMPARTMENT_EMB")
+$HITS        && COMMON_OPTS+=(--hits)
+$SMART_TRAIN && COMMON_OPTS+=(--smart-train)
 
-TUNE_OPTS="--pathway-name $PATHWAY_NAME --n-trials $N_TRIALS --storage $STORAGE"
-[[ -n "$DEVICE_FLAG" ]] && TUNE_OPTS+=" $DEVICE_FLAG"
+TUNE_OPTS=(--pathway-name "$PATHWAY_NAME" --n-trials "$N_TRIALS" --storage "$STORAGE")
+[[ -n "$DEVICE_FLAG" ]] && TUNE_OPTS+=("$DEVICE_FLAG")
 
 log() { echo; echo "════════════════════════════════════════════════════════"; echo "  $*"; echo "════════════════════════════════════════════════════════"; }
 
@@ -292,26 +305,28 @@ for MODEL in "${MODEL_LIST[@]}"; do
     rgcn)
         if $TUNE; then
             log "Tuning RGCN ($PATHWAY_NAME, $N_TRIALS trials)"
-            $PYTHON tune.py $INPUT_ARG $TUNE_OPTS \
+            $PYTHON tune.py "${INPUT_ARG[@]}" "${TUNE_OPTS[@]}" \
                 --out-json "${ABS_OUT_DIR}/best_params_rgcn.json" \
                 --out-csv  "${ABS_OUT_DIR}/optuna_history_rgcn.csv"
             BEST_RGCN="${ABS_OUT_DIR}/best_params_rgcn.json"
         fi
 
         log "Benchmarking RGCN ($PATHWAY_NAME, $SEEDS seeds × $EPOCHS epochs)"
-        RGCN_EXTRA=""
-        $INCLUDE_RGAT && RGCN_EXTRA+=" --include-rgat"
+        RGCN_EXTRA=()
+        $INCLUDE_RGAT && RGCN_EXTRA+=(--include-rgat)
 
         # If we just tuned, read the best params and override the defaults.
+        # Tuned values are all single-token numbers/categoricals (no spaces),
+        # so word-splitting this string back into array elements is safe.
         if $TUNE && [[ -f "${ABS_OUT_DIR}/best_params_rgcn.json" ]]; then
             BEST="$PYTHON -c \
 \"import json,sys; p=json.load(open('${ABS_OUT_DIR}/best_params_rgcn.json'))['best_params']; \
 sys.stdout.write(' '.join(['--'+k.replace('_','-')+' '+str(v) for k,v in p.items() if k not in ('epochs','time_target')]))\""
             TUNED_ARGS=$(eval $BEST)
-            RGCN_EXTRA+=" $TUNED_ARGS"
+            RGCN_EXTRA+=($TUNED_ARGS)
         fi
 
-        $PYTHON test.py $INPUT_ARG $COMMON_OPTS $RGCN_EXTRA \
+        $PYTHON test.py "${INPUT_ARG[@]}" "${COMMON_OPTS[@]}" "${RGCN_EXTRA[@]}" \
             --out-json "${ABS_OUT_DIR}/results_rgcn.json" \
             --out-csv  "${ABS_OUT_DIR}/results_rgcn.csv"
         ;;
@@ -320,23 +335,24 @@ sys.stdout.write(' '.join(['--'+k.replace('_','-')+' '+str(v) for k,v in p.items
     tgat)
         if $TUNE; then
             log "Tuning TGAT ($PATHWAY_NAME, $N_TRIALS trials)"
-            $PYTHON tune_tgat.py $INPUT_ARG $TUNE_OPTS \
+            $PYTHON tune_tgat.py "${INPUT_ARG[@]}" "${TUNE_OPTS[@]}" \
                 --out-json "${ABS_OUT_DIR}/best_params_tgat.json" \
                 --out-csv  "${ABS_OUT_DIR}/optuna_history_tgat.csv"
         fi
 
         log "Benchmarking TGAT ($PATHWAY_NAME, $SEEDS seeds × $EPOCHS epochs)"
-        TGAT_EXTRA="--n-heads $N_HEADS_TGAT --time-dim $TIME_DIM"
-        TGAT_EXTRA+=" --edge-feat-dim $EDGE_FEAT_DIM --max-neighbors $MAX_NEIGHBORS"
+        TGAT_EXTRA=(--n-heads "$N_HEADS_TGAT" --time-dim "$TIME_DIM")
+        TGAT_EXTRA+=(--edge-feat-dim "$EDGE_FEAT_DIM" --max-neighbors "$MAX_NEIGHBORS")
 
         if $TUNE && [[ -f "${ABS_OUT_DIR}/best_params_tgat.json" ]]; then
             BEST="$PYTHON -c \
 \"import json,sys; p=json.load(open('${ABS_OUT_DIR}/best_params_tgat.json'))['best_params']; \
 sys.stdout.write(' '.join(['--'+k.replace('_','-')+' '+str(v) for k,v in p.items() if k not in ('epochs','time_target')]))\""
-            TGAT_EXTRA+=" $(eval $BEST)"
+            TUNED_ARGS=$(eval $BEST)
+            TGAT_EXTRA+=($TUNED_ARGS)
         fi
 
-        $PYTHON test_tgat.py $INPUT_ARG $COMMON_OPTS $TGAT_EXTRA \
+        $PYTHON test_tgat.py "${INPUT_ARG[@]}" "${COMMON_OPTS[@]}" "${TGAT_EXTRA[@]}" \
             --out-json "${ABS_OUT_DIR}/results_tgat.json" \
             --out-csv  "${ABS_OUT_DIR}/results_tgat.csv"
         ;;
@@ -345,23 +361,24 @@ sys.stdout.write(' '.join(['--'+k.replace('_','-')+' '+str(v) for k,v in p.items
     hgcn)
         if $TUNE; then
             log "Tuning HGCN ($PATHWAY_NAME, $N_TRIALS trials)"
-            $PYTHON tune_hgcn.py $INPUT_ARG $TUNE_OPTS \
+            $PYTHON tune_hgcn.py "${INPUT_ARG[@]}" "${TUNE_OPTS[@]}" \
                 --out-json "${ABS_OUT_DIR}/best_params_hgcn.json" \
                 --out-csv  "${ABS_OUT_DIR}/optuna_history_hgcn.csv"
         fi
 
         log "Benchmarking HGCN ($PATHWAY_NAME, $SEEDS seeds × $EPOCHS epochs)"
-        HGCN_EXTRA="--n-heads $N_HEADS_HGCN"
-        $USE_ATTENTION && HGCN_EXTRA+=" --use-attention"
+        HGCN_EXTRA=(--n-heads "$N_HEADS_HGCN")
+        $USE_ATTENTION && HGCN_EXTRA+=(--use-attention)
 
         if $TUNE && [[ -f "${ABS_OUT_DIR}/best_params_hgcn.json" ]]; then
             BEST="$PYTHON -c \
 \"import json,sys; p=json.load(open('${ABS_OUT_DIR}/best_params_hgcn.json'))['best_params']; \
 sys.stdout.write(' '.join(['--'+k.replace('_','-')+' '+str(v) for k,v in p.items() if k not in ('epochs','time_target','use_attention','use_type_hyperedges')]))\""
-            HGCN_EXTRA+=" $(eval $BEST)"
+            TUNED_ARGS=$(eval $BEST)
+            HGCN_EXTRA+=($TUNED_ARGS)
         fi
 
-        $PYTHON test_hgcn.py $INPUT_ARG $COMMON_OPTS $HGCN_EXTRA \
+        $PYTHON test_hgcn.py "${INPUT_ARG[@]}" "${COMMON_OPTS[@]}" "${HGCN_EXTRA[@]}" \
             --out-json "${ABS_OUT_DIR}/results_hgcn.json" \
             --out-csv  "${ABS_OUT_DIR}/results_hgcn.csv"
         ;;
@@ -370,25 +387,27 @@ sys.stdout.write(' '.join(['--'+k.replace('_','-')+' '+str(v) for k,v in p.items
     sthn)
         if $TUNE; then
             log "Tuning STHN ($PATHWAY_NAME, $N_TRIALS trials)"
-            $PYTHON tune_sthn.py $INPUT_ARG $TUNE_OPTS \
+            $PYTHON tune_sthn.py "${INPUT_ARG[@]}" "${TUNE_OPTS[@]}" \
                 --out-json "${ABS_OUT_DIR}/best_params_sthn.json" \
                 --out-csv  "${ABS_OUT_DIR}/optuna_history_sthn.csv"
         fi
 
         log "Benchmarking STHN ($PATHWAY_NAME, $SEEDS seeds × $EPOCHS epochs)"
-        STHN_EXTRA="--n-heads $N_HEADS_STHN --time-dim $TIME_DIM"
-        STHN_EXTRA+=" --edge-feat-dim $EDGE_FEAT_DIM --max-edges $MAX_EDGES"
-        STHN_EXTRA+=" --window-size $WINDOW_SIZE"
-        STHN_EXTRA+=" --channel-expansion-factor $CHANNEL_EXPANSION_FACTOR"
+        STHN_EXTRA=(--n-heads "$N_HEADS_STHN" --time-dim "$TIME_DIM")
+        STHN_EXTRA+=(--edge-feat-dim "$EDGE_FEAT_DIM" --max-edges "$MAX_EDGES")
+        STHN_EXTRA+=(--window-size "$WINDOW_SIZE")
+        STHN_EXTRA+=(--channel-expansion-factor "$CHANNEL_EXPANSION_FACTOR")
+        $TIME_ABLATION && STHN_EXTRA+=(--time-ablation)
 
         if $TUNE && [[ -f "${ABS_OUT_DIR}/best_params_sthn.json" ]]; then
             BEST="$PYTHON -c \
 \"import json,sys; p=json.load(open('${ABS_OUT_DIR}/best_params_sthn.json'))['best_params']; \
 sys.stdout.write(' '.join(['--'+k.replace('_','-')+' '+str(v) for k,v in p.items() if k not in ('epochs','time_target')]))\""
-            STHN_EXTRA+=" $(eval $BEST)"
+            TUNED_ARGS=$(eval $BEST)
+            STHN_EXTRA+=($TUNED_ARGS)
         fi
 
-        $PYTHON test_sthn.py $INPUT_ARG $COMMON_OPTS $STHN_EXTRA \
+        $PYTHON test_sthn.py "${INPUT_ARG[@]}" "${COMMON_OPTS[@]}" "${STHN_EXTRA[@]}" \
             --out-json "${ABS_OUT_DIR}/results_sthn.json" \
             --out-csv  "${ABS_OUT_DIR}/results_sthn.csv"
         ;;

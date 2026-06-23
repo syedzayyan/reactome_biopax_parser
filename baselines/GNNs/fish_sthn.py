@@ -161,18 +161,32 @@ def _build_train_adjacency(
 
 
 class _FeatEncode(nn.Module):
-    """Edge-type embedding + Time2Vec(time-delta) -> hidden."""
+    """Edge-type embedding + Time2Vec(time-delta) -> hidden.
 
-    def __init__(self, time_dim: int, edge_feat_dim: int, hidden: int):
+    use_time_encoding=False drops the Time2Vec submodule entirely (rather
+    than zeroing its output) so the no-time condition has no path for
+    temporal information to reach the mixer, mirroring fish_rgcn.py's
+    time_encoding ablation.
+    """
+
+    def __init__(
+        self, time_dim: int, edge_feat_dim: int, hidden: int,
+        use_time_encoding: bool = True,
+    ):
         super().__init__()
-        self.time_encoder = Time2Vec(time_dim)
-        self.proj = nn.Linear(time_dim + edge_feat_dim, hidden)
+        self.use_time_encoding = use_time_encoding
+        self.time_encoder = Time2Vec(time_dim) if use_time_encoding else None
+        proj_in = edge_feat_dim + (time_dim if use_time_encoding else 0)
+        self.proj = nn.Linear(proj_in, hidden)
 
     def forward(self, edge_feat: torch.Tensor, time_delta: torch.Tensor) -> torch.Tensor:
         # edge_feat: (B, L, edge_feat_dim); time_delta: (B, L)
-        # Time2Vec(time_delta) -> (B, L, time_dim).
-        t_feat = self.time_encoder(time_delta)
-        x = torch.cat([edge_feat, t_feat], dim=-1)
+        if self.use_time_encoding:
+            # Time2Vec(time_delta) -> (B, L, time_dim).
+            t_feat = self.time_encoder(time_delta)
+            x = torch.cat([edge_feat, t_feat], dim=-1)
+        else:
+            x = edge_feat
         return self.proj(x)
 
 
@@ -272,6 +286,7 @@ class FISHSTHN(nn.Module):
         n_negatives: int = 5,
         use_compartment: bool = False,
         smart_negatives: bool = False,
+        use_time_encoding: bool = True,
     ):
         super().__init__()
         self.order_mode = order_mode
@@ -279,6 +294,7 @@ class FISHSTHN(nn.Module):
         self.n_negatives = n_negatives
         self.use_compartment = use_compartment
         self.smart_negatives = smart_negatives
+        self.use_time_encoding = use_time_encoding
         self.max_edges = max_edges
 
         if use_compartment and data.compartment_dim == 0:
@@ -298,7 +314,9 @@ class FISHSTHN(nn.Module):
         self.edge_type_emb = nn.Embedding(
             data.n_edge_types + 1, edge_feat_dim, padding_idx=data.n_edge_types
         )
-        self.feat_encode = _FeatEncode(time_dim, edge_feat_dim, hidden)
+        self.feat_encode = _FeatEncode(
+            time_dim, edge_feat_dim, hidden, use_time_encoding=use_time_encoding,
+        )
         per_graph_size = 2 * max_edges
         self.mixer = _PatchMixer(
             per_graph_size=per_graph_size,
