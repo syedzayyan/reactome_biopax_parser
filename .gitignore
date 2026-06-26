@@ -33,3 +33,5 @@ graph_mutant.json
 
 models/
 baselines/rem_proj/
+sthn_results/
+paper_source/

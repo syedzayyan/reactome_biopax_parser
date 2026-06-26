@@ -17,7 +17,7 @@ rather than relying on a single static per-node embedding:
     of every training edge see it in their context).
   - For a query (src, dst), the "subgraph" is the concatenation of src's and
     dst's adjacency rows: 2*max_edges edges, each described by its edge-type
-    embedding and a Time2Vec encoding of (ref_time[node] - edge_time).
+    embedding and a TimeEncode encoding of (ref_time[node] - edge_time).
   - A windowed Transformer mixer (`_PatchMixer`, in the spirit of the
     Patch_Encoding / channel-mixer used by STHN) compresses this sequence
     into a single link-context vector per query.
@@ -57,7 +57,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tgm.nn import Time2Vec
+# Shared fixed-frequency cosine time encoder (GraphMixer-style), also used by
+# fish_rgcn.py and fish_tgat.py. Replaces the learnable Time2Vec (Kazemi et
+# al. 2019 / TGAT) this module used previously.
+from time_encoding import TimeEncode
 from coral_pytorch.losses import corn_loss as _corn_loss
 from coral_pytorch.losses import coral_loss as _coral_loss
 from coral_pytorch.dataset import corn_label_from_logits as _corn_label_from_logits
@@ -161,12 +164,13 @@ def _build_train_adjacency(
 
 
 class _FeatEncode(nn.Module):
-    """Edge-type embedding + Time2Vec(time-delta) -> hidden.
+    """Edge-type embedding + TimeEncode(time-delta) -> hidden.
 
-    use_time_encoding=False drops the Time2Vec submodule entirely (rather
+    use_time_encoding=False drops the TimeEncode submodule entirely (rather
     than zeroing its output) so the no-time condition has no path for
-    temporal information to reach the mixer, mirroring fish_rgcn.py's
-    time_encoding ablation.
+    temporal information to reach the mixer, mirroring fish_rgcn.py's and
+    fish_tgat.py's time-encoding ablations. TimeEncode (time_encoding.py) is
+    the same frozen GraphMixer-style encoder used by all three baselines.
     """
 
     def __init__(
@@ -175,15 +179,16 @@ class _FeatEncode(nn.Module):
     ):
         super().__init__()
         self.use_time_encoding = use_time_encoding
-        self.time_encoder = Time2Vec(time_dim) if use_time_encoding else None
+        self.time_encoder = TimeEncode(time_dim) if use_time_encoding else None
         proj_in = edge_feat_dim + (time_dim if use_time_encoding else 0)
         self.proj = nn.Linear(proj_in, hidden)
 
     def forward(self, edge_feat: torch.Tensor, time_delta: torch.Tensor) -> torch.Tensor:
         # edge_feat: (B, L, edge_feat_dim); time_delta: (B, L)
         if self.use_time_encoding:
-            # Time2Vec(time_delta) -> (B, L, time_dim).
-            t_feat = self.time_encoder(time_delta)
+            # TimeEncode flattens internally to (-1, 1) regardless of input
+            # shape, so reshape its output back to (B, L, time_dim).
+            t_feat = self.time_encoder(time_delta).reshape(*time_delta.shape, -1)
             x = torch.cat([edge_feat, t_feat], dim=-1)
         else:
             x = edge_feat

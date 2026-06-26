@@ -55,38 +55,10 @@ from coral_pytorch.losses import corn_loss as _corn_loss
 from coral_pytorch.losses import coral_loss as _coral_loss
 from coral_pytorch.dataset import corn_label_from_logits as _corn_label_from_logits
 
-
-# ── time encoding (GraphMixer-style, Cong et al. 2023) ──────────────────────
-
-
-class TimeEncode(nn.Module):
-    """
-    Fixed-frequency cosine time encoding from GraphMixer (Cong et al. 2023).
-
-        phi(t) = cos(w * t)
-
-    with ``w`` initialised to a log-spaced grid 10^{0..9} / dim and frozen.
-    Maps a scalar time to a ``dim``-dimensional vector.
-    """
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = dim
-        self.w = nn.Linear(1, dim)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        freqs = 1.0 / (10.0 ** np.linspace(0, 9, self.dim, dtype=np.float32))
-        self.w.weight = nn.Parameter(
-            torch.from_numpy(freqs).reshape(self.dim, 1), requires_grad=False
-        )
-        self.w.bias = nn.Parameter(
-            torch.zeros(self.dim), requires_grad=False
-        )
-
-    @torch.no_grad()
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        return torch.cos(self.w(t.reshape(-1, 1)))
+# Shared fixed-frequency cosine time encoder (GraphMixer-style), also used by
+# fish_tgat.py and fish_sthn.py so "time encoding" is the same module
+# everywhere it's ablated.
+from time_encoding import TimeEncode
 
 
 # ── relational message passing with edge-time features ─────────────────────

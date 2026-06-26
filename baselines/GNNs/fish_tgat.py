@@ -6,8 +6,10 @@ Same three tasks as fish_rgcn.py:
   * type      — k-way classification over edge types, cross-entropy on positives
   * order     — regression / CORN / CORAL on normalised step times
 
-Encoder is TGAT (Xu et al. 2020), using TGM library's TemporalAttention and
-Time2Vec building blocks, adapted to the heterogeneous FISH graph:
+Encoder is TGAT (Xu et al. 2020), using TGM library's TemporalAttention with
+the shared fixed-frequency TimeEncode (time_encoding.py, also used by
+fish_rgcn.py and fish_sthn.py) for time encoding, adapted to the
+heterogeneous FISH graph:
   - Per-node-type input projections to a shared hidden dim (same as FISHRGCN)
   - Edge type embedded to edge_feat_dim before temporal attention
   - Reference time per node = normalised max incident training-edge time
@@ -38,7 +40,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tgm.nn import TemporalAttention, Time2Vec
+from tgm.nn import TemporalAttention
+
+# Shared fixed-frequency cosine time encoder (GraphMixer-style), also used by
+# fish_rgcn.py and fish_sthn.py. Note this replaces the learnable Time2Vec
+# (Kazemi et al. 2019 / TGAT) this module used previously -- "time encoding"
+# now means the same frozen encoder across all three baselines.
+from time_encoding import TimeEncode
 from coral_pytorch.losses import corn_loss as _corn_loss
 from coral_pytorch.losses import coral_loss as _coral_loss
 from coral_pytorch.dataset import corn_label_from_logits as _corn_label_from_logits
@@ -147,9 +155,20 @@ class FISHTGATEncoder(nn.Module):
     then merges attention output with the initial projected features via a
     two-layer MLP (residual skip to input, following the original TGAT paper).
 
-    Edge type is embedded to edge_feat_dim; time is encoded by Time2Vec on
-    the per-edge (ref_time - edge_time) delta, so each layer sees genuine
-    causal temporal context.
+    Edge type is embedded to edge_feat_dim; time is encoded by TimeEncode
+    (shared fixed-frequency cosine encoder, see time_encoding.py) on the
+    per-edge (ref_time - edge_time) delta, so each layer sees genuine causal
+    temporal context.
+
+    use_time_encoding=False zeroes both the reference-time and time-delta
+    inputs to TimeEncode before every call, so time_feat/nbr_time_feat
+    collapse to the constant vector cos(b) for every node and neighbour
+    regardless of real timestamps. TemporalAttention's signature requires
+    time tensors of fixed shape, so (unlike fish_sthn.py, which drops its
+    time submodule entirely) this is a constant-time ablation rather than an
+    architectural one. TimeEncode's weights are frozen either way (same
+    encoder fish_rgcn.py uses), so this ablation purely tests whether the
+    model sees a real timestamp at all, not whether the encoder can learn.
     """
 
     def __init__(
@@ -161,11 +180,13 @@ class FISHTGATEncoder(nn.Module):
         edge_feat_dim: int,
         n_edge_types: int,
         dropout: float,
+        use_time_encoding: bool = True,
     ):
         super().__init__()
         self.dropout = dropout
+        self.use_time_encoding = use_time_encoding
 
-        self.time_encoder = Time2Vec(time_dim)
+        self.time_encoder = TimeEncode(time_dim)
 
         # n_edge_types + 1 embeddings; index n_edge_types is the padding sentinel.
         self.edge_type_emb = nn.Embedding(
@@ -205,9 +226,12 @@ class FISHTGATEncoder(nn.Module):
         """Return updated node embeddings of shape (N, hidden)."""
         h = h_init
 
+        if not self.use_time_encoding:
+            ref_times = torch.zeros_like(ref_times)
+
         # Reference-time encoding, computed once for all layers.
-        # Time2Vec(ref_times) with ref_times.shape=(N,):
-        #   unsqueeze(-1) → (N,1) → Linear → (N, time_dim).
+        # TimeEncode(ref_times) with ref_times.shape=(N,):
+        #   reshape(-1,1) → (N,1) → Linear → cos → (N, time_dim).
         time_feat = self.time_encoder(ref_times)  # (N, time_dim)
 
         for attn, merge in zip(self.attn_layers, self.merge_layers):
@@ -220,11 +244,15 @@ class FISHTGATEncoder(nn.Module):
             edge_feat = edge_feat * valid_mask.unsqueeze(-1).float()
 
             # Temporal delta: ref_time - edge_time (causal, so >= 0 by construction).
-            # Time2Vec(time_diffs) with time_diffs.shape=(N,K):
-            #   unsqueeze(-1) → (N,K,1) → Linear → (N,K,time_dim).
-            time_diffs = (ref_times.unsqueeze(1) - nbr_times).clamp(min=0.0)
-            time_diffs = time_diffs * valid_mask.float()
-            nbr_time_feat = self.time_encoder(time_diffs)    # (N, K, time_dim)
+            # TimeEncode flattens its input to (-1, 1) internally regardless of
+            # the original shape, so time_diffs.shape=(N,K) comes back as
+            # (N*K, time_dim) -- reshape back before using it as (N,K,time_dim).
+            if self.use_time_encoding:
+                time_diffs = (ref_times.unsqueeze(1) - nbr_times).clamp(min=0.0)
+                time_diffs = time_diffs * valid_mask.float()
+            else:
+                time_diffs = torch.zeros_like(nbr_times)
+            nbr_time_feat = self.time_encoder(time_diffs).reshape(*time_diffs.shape, -1)
             nbr_time_feat = nbr_time_feat * valid_mask.unsqueeze(-1).float()
 
             # Temporal attention (all N nodes in one batch).
@@ -277,6 +305,7 @@ class FISHTGAT(nn.Module):
         n_negatives: int = 5,
         use_compartment: bool = False,
         smart_negatives: bool = False,
+        use_time_encoding: bool = True,
     ):
         super().__init__()
         self.order_mode = order_mode
@@ -284,6 +313,7 @@ class FISHTGAT(nn.Module):
         self.n_negatives = n_negatives
         self.use_compartment = use_compartment
         self.smart_negatives = smart_negatives
+        self.use_time_encoding = use_time_encoding
         self.max_neighbors = max_neighbors
 
         if use_compartment and data.compartment_dim == 0:
@@ -308,7 +338,16 @@ class FISHTGAT(nn.Module):
             edge_feat_dim=edge_feat_dim,
             n_edge_types=data.n_edge_types,
             dropout=dropout,
+            use_time_encoding=use_time_encoding,
         )
+
+        # Cached neighbor table — built once from training edges (leakage-proof).
+        # Analogous to FISHSTHN's _adj_etype/_adj_dt/_adj_valid cache.
+        self._nbr_ids:   Optional[torch.Tensor] = None
+        self._nbr_types: Optional[torch.Tensor] = None
+        self._nbr_times: Optional[torch.Tensor] = None
+        self._nbr_valid: Optional[torch.Tensor] = None
+        self._nbr_ref:   Optional[torch.Tensor] = None
 
         # Task heads — identical architecture to FISHRGCN for comparability.
         head_in = 2 * hidden
@@ -369,10 +408,17 @@ class FISHTGAT(nn.Module):
     def encode(self, data: FISHData) -> torch.Tensor:
         """Return node embeddings of shape (N, hidden)."""
         device = next(self.parameters()).device
+        if self._nbr_ids is None or self._nbr_ids.device != device:
+            (self._nbr_ids, self._nbr_types, self._nbr_times,
+             self._nbr_valid, self._nbr_ref) = _build_neighbor_table(
+                data, self.max_neighbors, device
+            )
         h_init = self._project_inputs(data, device)
-        nbr_ids, nbr_types, nbr_times, valid_mask, ref_times = \
-            _build_neighbor_table(data, self.max_neighbors, device)
-        return self.tgat_encoder(h_init, nbr_ids, nbr_types, nbr_times, valid_mask, ref_times)
+        return self.tgat_encoder(
+            h_init,
+            self._nbr_ids, self._nbr_types, self._nbr_times,
+            self._nbr_valid, self._nbr_ref,
+        )
 
     # ── heads ────────────────────────────────────────────────────────────────
 

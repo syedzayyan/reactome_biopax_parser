@@ -7,8 +7,8 @@ Conditions
 
   Pass --time-ablation to also sweep the time-encoding axis (12 conditions):
   {no-time, +time} x {no-compartment, +compartment} x {regression, CORN, CORAL}.
-  "+time" keeps STHN's native Time2Vec edge-time encoding (the default);
-  "no-time" drops the Time2Vec submodule from the subgraph mixer entirely
+  "+time" keeps STHN's native TimeEncode edge-time encoding (the default);
+  "no-time" drops the TimeEncode submodule from the subgraph mixer entirely
   (see fish_sthn.py's use_time_encoding), mirroring fish_rgcn.py's time
   ablation so the two baselines are comparable on this axis. Off by default
   since it doubles runtime on top of an already mixer-heavy baseline.
@@ -69,7 +69,7 @@ class Condition:
 def _make_conditions(include_time_ablation: bool = False) -> list[Condition]:
     # Factorial over time x compartment x decoder, matching fish_rgcn.py's
     # _make_conditions naming convention ("+t" / "+c" suffixes). Time defaults
-    # to always-on (STHN's native Time2Vec) unless the ablation is requested,
+    # to always-on (STHN's native TimeEncode) unless the ablation is requested,
     # which adds the no-time variants and doubles the condition count.
     conditions = []
     time_choices = (False, True) if include_time_ablation else (True,)
@@ -320,7 +320,7 @@ def main():
     parser.add_argument("--n-negatives", type=int, default=10)
     parser.add_argument(
         "--time-ablation", action="store_true",
-        help="Also run the no-time-encoding variants (Time2Vec dropped from "
+        help="Also run the no-time-encoding variants (TimeEncode dropped from "
              "the subgraph mixer). Default: time-encoding always on, 6 "
              "conditions. With --time-ablation: 12 conditions, ~2x runtime.",
     )

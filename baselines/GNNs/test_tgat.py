@@ -5,6 +5,13 @@ Conditions
 ----------
   {TGAT, TGAT + compartment} x {regression, CORN, CORAL}
 
+  Pass --time-ablation to also sweep the time-encoding axis (12 conditions):
+  {no-time, +time} x {no-compartment, +compartment} x {regression, CORN, CORAL}.
+  "no-time" zeroes the reference-time and time-delta inputs to TimeEncode
+  before every TemporalAttention call (see fish_tgat.py's use_time_encoding),
+  mirroring fish_rgcn.py's and fish_sthn.py's time ablations so all three
+  baselines are comparable on this axis. Off by default.
+
 Usage
 -----
     python test_tgat.py \
@@ -45,6 +52,7 @@ from fish_tgat import FISHTGAT, build_dataset, evaluate, train
 @dataclass
 class Condition:
     name: str
+    use_time: bool
     use_compartment: bool
     order_mode: str
 
@@ -55,22 +63,32 @@ class Condition:
         return (1.0, 1.0, 1.0)
 
 
-def _make_conditions() -> list[Condition]:
+def _make_conditions(include_time_ablation: bool = False) -> list[Condition]:
+    # Factorial over time x compartment x decoder, matching fish_rgcn.py's
+    # _make_conditions naming convention ("+t" / "+c" suffixes). Time defaults
+    # to always-on (TGAT's native TimeEncode) unless the ablation is requested,
+    # which adds the no-time variants and doubles the condition count.
     conditions = []
-    for comp in (False, True):
-        for decoder in ("regression", "corn", "coral"):
-            name_parts = ["tgat"]
-            if comp:
-                name_parts.append("+c")
-            name_parts.append(f"/{decoder}")
-            conditions.append(Condition(
-                name=" ".join(name_parts).replace(" /", "/"),
-                use_compartment=comp,
-                order_mode=decoder,
-            ))
+    time_choices = (False, True) if include_time_ablation else (True,)
+    for time_enc in time_choices:
+        for comp in (False, True):
+            for decoder in ("regression", "corn", "coral"):
+                name_parts = ["tgat"]
+                if time_enc:
+                    name_parts.append("+t")
+                if comp:
+                    name_parts.append("+c")
+                name_parts.append(f"/{decoder}")
+                conditions.append(Condition(
+                    name=" ".join(name_parts).replace(" /", "/"),
+                    use_time=time_enc,
+                    use_compartment=comp,
+                    order_mode=decoder,
+                ))
     return conditions
 
 
+# Conditions are rebuilt at CLI parse time once we know --time-ablation.
 CONDITIONS = _make_conditions()
 
 
@@ -189,6 +207,7 @@ def run_one(
         n_negatives=n_negatives,
         use_compartment=condition.use_compartment,
         smart_negatives=smart_train,
+        use_time_encoding=condition.use_time,
     )
     base_lw = condition.loss_weights
     effective_lw = (base_lw[0], base_lw[1], base_lw[2] * order_weight)
@@ -206,6 +225,7 @@ def run_one(
     metrics["seconds"] = round(time.time() - start, 1)
     metrics["seed"] = seed
     metrics["condition"] = condition.name
+    metrics["use_time_encoding"] = condition.use_time
     metrics["use_compartment"] = condition.use_compartment
     metrics["order_mode"] = condition.order_mode
     metrics["time_target"] = time_target
@@ -284,6 +304,12 @@ def main():
                         help="Compute Hits@K (expensive).")
     parser.add_argument("--smart-train", action="store_true")
     parser.add_argument("--n-negatives", type=int, default=10)
+    parser.add_argument(
+        "--time-ablation", action="store_true",
+        help="Also run the no-time-encoding variants (time zeroed in TemporalAttention, "
+             "see fish_tgat.py's use_time_encoding). Default: time-encoding always on, "
+             "6 conditions. With --time-ablation: 12 conditions, ~2x runtime.",
+    )
     parser.add_argument("--out-json", default="results_tgat.json")
     parser.add_argument("--out-csv", default="results_tgat.csv")
     parser.add_argument("--compartment-embeddings", default=None)
@@ -316,6 +342,10 @@ def main():
             print(f"[main] Loaded from {_tune_path}: {', '.join(_overridden)}")
     elif args.tune_json != "best_params_tgat.json":
         parser.error(f"--tune-json file not found: {args.tune_json}")
+
+    # Rebuild conditions list based on whether the time ablation was requested.
+    global CONDITIONS
+    CONDITIONS = _make_conditions(args.time_ablation)
 
     if args.gpu and args.cpu:
         parser.error("Cannot pass --gpu and --cpu together.")

@@ -116,12 +116,14 @@
 #   --use-attention       (HGCN only) Use the attention variant of
 #                         HypergraphConv. Off by default.
 #
-#   --time-ablation       (STHN only) Also run the no-time-encoding variants
-#                         (Time2Vec dropped from the subgraph mixer), mirroring
-#                         RGCN's time ablation. Default: time-encoding always
-#                         on, 6 conditions. With --time-ablation: 12 conditions,
-#                         ~2x STHN runtime. Tuning is unaffected (always tunes
-#                         the +time headline condition).
+#   --time-ablation       (TGAT + STHN) Also run the no-time-encoding variants,
+#                         mirroring RGCN's always-on time ablation. For STHN:
+#                         TimeEncode dropped from the subgraph mixer. For TGAT:
+#                         reference-time and time-delta zeroed in TemporalAttention.
+#                         Default: time-encoding always on, 6 conditions per model.
+#                         With --time-ablation: 12 conditions per model, ~2x runtime.
+#                         Tuning is unaffected (always tunes the +time headline
+#                         condition). RGCN always runs both time variants regardless.
 #
 #   --storage URL         Optuna storage URL shared by all tuners.
 #                         Default: sqlite:///optuna_studies.db (in --out-dir).
@@ -343,6 +345,7 @@ sys.stdout.write(' '.join(['--'+k.replace('_','-')+' '+str(v) for k,v in p.items
         log "Benchmarking TGAT ($PATHWAY_NAME, $SEEDS seeds × $EPOCHS epochs)"
         TGAT_EXTRA=(--n-heads "$N_HEADS_TGAT" --time-dim "$TIME_DIM")
         TGAT_EXTRA+=(--edge-feat-dim "$EDGE_FEAT_DIM" --max-neighbors "$MAX_NEIGHBORS")
+        $TIME_ABLATION && TGAT_EXTRA+=(--time-ablation)
 
         if $TUNE && [[ -f "${ABS_OUT_DIR}/best_params_tgat.json" ]]; then
             BEST="$PYTHON -c \
