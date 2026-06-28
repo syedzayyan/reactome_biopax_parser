@@ -532,7 +532,7 @@ def _hits_at_k_sthn(
     candidate_pool: torch.Tensor,
     n_nodes_total: int,
     ks: tuple[int, ...] = (1, 10, 100),
-    dyads_per_chunk: int = 1_000_000,
+    dyads_per_chunk: int = 9_000,
     max_candidates: int = 300,
 ) -> dict:
     """
@@ -550,6 +550,14 @@ def _hits_at_k_sthn(
     sampled uniformly at random (with replacement) from candidate_pool.
     Rank = #candidates with a strictly higher existence score than dst, + 1.
     Hits@K / MRR are accumulated the same way as _hits_at_k.
+
+    dyads_per_chunk controls the CUDA batch size: batch_size = dyads_per_chunk
+    // max_candidates source nodes are scored per call, so the peak tensor in
+    the mixer is (batch_size * max_candidates, 2*max_edges, hidden). The
+    default 9_000 caps this at ~30 * 300 = 9K pairs → ~184 MB at hidden=128,
+    max_edges=20. Unlike _hits_at_k's 1M default (cheap MLP on fixed
+    embeddings), the mixer's memory cost scales with pairs, not just src nodes.
+    Bind a larger value via functools.partial if GPU memory allows it.
 
     This is a sampled-ranking approximation, not the exact full-pool metric
     that RGCN/TGAT report — treat STHN's Hits@K/MRR as directionally
@@ -611,7 +619,7 @@ def evaluate(
     seed: int = 0,
     compute_hits: bool = False,
     hits_ks: tuple[int, ...] = (1, 10, 100),
-    hits_batch: int = 2048,
+    hits_batch: int = 9_000,
     max_hits_candidates: int = 300,
 ) -> dict:
     """
@@ -621,9 +629,19 @@ def evaluate(
     metrics are directly comparable across RGCN/TGAT/STHN. Hits@K/MRR use
     _hits_at_k_sthn (sampled-ranking approximation, see its docstring)
     instead of fish_rgcn's full-pool _hits_at_k.
+
+    hits_batch sets dyads_per_chunk for _hits_at_k_sthn: the total number of
+    (src, candidate) pairs sent through the mixer per CUDA call. Keep it at
+    9_000 (≈30 src × 300 cands, ~184 MB) to avoid OOM; increase only if
+    GPU memory allows. _score_edge_set does not forward hits_batch to hits_fn,
+    so we bind it here via partial instead.
     """
     with torch.no_grad():
-        hits_fn = partial(_hits_at_k_sthn, max_candidates=max_hits_candidates)
+        hits_fn = partial(
+            _hits_at_k_sthn,
+            max_candidates=max_hits_candidates,
+            dyads_per_chunk=hits_batch,
+        )
         return _evaluate_impl(
             model, data, n_neg_per_pos, device, seed,
             compute_hits=compute_hits,

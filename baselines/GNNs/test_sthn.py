@@ -165,6 +165,7 @@ def set_seed(seed: int) -> None:
 def run_one(
     G,
     condition: Condition,
+    data: "FISHData",
     seed: int,
     epochs: int,
     hidden: int,
@@ -178,7 +179,6 @@ def run_one(
     window_size: int,
     channel_expansion_factor: int,
     device: str,
-    compartment_embeddings: Optional[dict] = None,
     verbose: bool = False,
     compute_hits: bool = False,
     smart_train: bool = False,
@@ -188,16 +188,6 @@ def run_one(
     order_weight: float = 1.0,
 ) -> dict:
     set_seed(seed)
-    data = build_dataset(
-        G,
-        split="semi_inductive",
-        unseen_node_frac=0.20,
-        order_mode=condition.order_mode,
-        n_order_bins=n_order_bins,
-        compartment_embeddings=compartment_embeddings if condition.use_compartment else None,
-        time_target=time_target,
-        seed=seed,
-    )
     model = FISHSTHN(
         data,
         hidden=hidden,
@@ -332,6 +322,11 @@ def main():
         help="Path to best_params_sthn.json written by a tune_sthn.py sweep. "
              "Loaded automatically if the file exists; CLI flags take precedence.",
     )
+    parser.add_argument(
+        "--split-cache", default=None,
+        help="Path to a JSON file for caching the semi-inductive split per seed. "
+             "Shared with RGCN and TGAT to guarantee identical train/test masks.",
+    )
     args = parser.parse_args()
 
     # Auto-load tuned hyperparameters; CLI flags win over JSON values.
@@ -414,13 +409,30 @@ def main():
     print(f"[main] epochs={args.epochs}  hidden={args.hidden}  n_heads={args.n_heads}  "
           f"max_edges={args.max_edges}  window_size={args.window_size}  lr={args.lr}")
 
+    order_modes = list(dict.fromkeys(c.order_mode for c in CONDITIONS))
+
     results = []
-    for ci, condition in enumerate(CONDITIONS, 1):
-        for seed in range(args.seeds):
-            run_idx = (ci - 1) * args.seeds + seed + 1
+    run_idx = 0
+    for seed in range(args.seeds):
+        data_for_mode = {
+            mode: build_dataset(
+                G,
+                split="semi_inductive",
+                unseen_node_frac=0.20,
+                order_mode=mode,
+                n_order_bins=args.n_order_bins,
+                compartment_embeddings=compartment_embeddings,
+                time_target=args.time_target,
+                split_cache=args.split_cache,
+                seed=seed,
+            )
+            for mode in order_modes
+        }
+        for condition in CONDITIONS:
+            run_idx += 1
             print(f"\n[{run_idx}/{n_runs}] {condition.name}  seed={seed}")
             m = run_one(
-                G, condition, seed,
+                G, condition, data_for_mode[condition.order_mode], seed,
                 epochs=args.epochs, hidden=args.hidden,
                 n_layers=args.n_layers, n_heads=args.n_heads,
                 lr=args.lr, n_order_bins=args.n_order_bins,
@@ -428,7 +440,6 @@ def main():
                 max_edges=args.max_edges, window_size=args.window_size,
                 channel_expansion_factor=args.channel_expansion_factor,
                 device=device,
-                compartment_embeddings=compartment_embeddings,
                 verbose=args.verbose,
                 compute_hits=args.hits,
                 smart_train=args.smart_train,

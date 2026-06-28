@@ -127,6 +127,12 @@
 #
 #   --storage URL         Optuna storage URL shared by all tuners.
 #                         Default: sqlite:///optuna_studies.db (in --out-dir).
+#
+#   --split-cache PATH    JSON file shared across model scripts so RGCN, TGAT
+#                         and STHN all use identical semi-inductive splits per
+#                         seed. First model to run a given seed writes the
+#                         unseen node names; subsequent models load them.
+#                         Default: <out-dir>/split_cache.json.
 
 set -euo pipefail
 
@@ -166,6 +172,7 @@ CHANNEL_EXPANSION_FACTOR=2
 USE_ATTENTION=false
 TIME_ABLATION=false
 STORAGE=""            # resolved to file inside OUT_DIR after parsing
+SPLIT_CACHE=""        # resolved to file inside OUT_DIR after parsing
 
 # ── argument parsing ──────────────────────────────────────────────────────────
 
@@ -204,6 +211,7 @@ while [[ $# -gt 0 ]]; do
         --use-attention)     USE_ATTENTION=true;                    shift   ;;
         --time-ablation)     TIME_ABLATION=true;                    shift   ;;
         --storage)           STORAGE="$2";                          shift 2 ;;
+        --split-cache)       SPLIT_CACHE="$2";                      shift 2 ;;
         -h|--help)
             grep '^#' "$0" | grep -v '#!/' | sed 's/^# \?//'
             exit 0
@@ -264,6 +272,10 @@ mkdir -p "$ABS_OUT_DIR"
 # Optuna storage lives inside ABS_OUT_DIR unless the caller set --storage.
 [[ -z "$STORAGE" ]] && STORAGE="sqlite:///${ABS_OUT_DIR}/optuna_studies.db"
 
+# Split cache: shared across all models so RGCN, TGAT, STHN see identical
+# train/test masks for each seed. Lives in ABS_OUT_DIR unless overridden.
+[[ -z "$SPLIT_CACHE" ]] && SPLIT_CACHE="${ABS_OUT_DIR}/split_cache.json"
+
 # Input graph argument — always absolute. Built as an array (not a string)
 # so values containing spaces (e.g. --pathway-name "Cell Cycle") survive
 # intact instead of being word-split when expanded below.
@@ -290,6 +302,7 @@ COMMON_OPTS=(
 [[ -n "$COMPARTMENT_EMB" ]] && COMMON_OPTS+=(--compartment-embeddings "$COMPARTMENT_EMB")
 $HITS        && COMMON_OPTS+=(--hits)
 $SMART_TRAIN && COMMON_OPTS+=(--smart-train)
+COMMON_OPTS+=(--split-cache "$SPLIT_CACHE")
 
 TUNE_OPTS=(--pathway-name "$PATHWAY_NAME" --n-trials "$N_TRIALS" --storage "$STORAGE")
 [[ -n "$DEVICE_FLAG" ]] && TUNE_OPTS+=("$DEVICE_FLAG")

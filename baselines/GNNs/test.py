@@ -194,6 +194,7 @@ def set_seed(seed: int) -> None:
 def run_one(
     G,
     condition: Condition,
+    data: "FISHData",
     seed: int,
     epochs: int,
     hidden: int,
@@ -202,7 +203,6 @@ def run_one(
     n_order_bins: int,
     time_dim: int,
     device: str,
-    compartment_embeddings: Optional[dict] = None,
     verbose: bool = False,
     compute_hits: bool = False,
     smart_train: bool = False,
@@ -212,16 +212,6 @@ def run_one(
     order_weight: float = 1.0,
 ) -> dict:
     set_seed(seed)
-    data = build_dataset(
-        G,
-        split="semi_inductive",
-        unseen_node_frac=0.20,
-        order_mode=condition.order_mode,
-        n_order_bins=n_order_bins,
-        compartment_embeddings=compartment_embeddings,
-        time_target=time_target,
-        seed=seed,
-    )
     model = FISHRGCN(
         data,
         hidden=hidden,
@@ -391,6 +381,14 @@ def main():
              "vectors. When omitted, a one-hot per compartment vocab is used "
              "instead — equivalent to a learned embedding via the input projection."
     )
+    parser.add_argument(
+        "--split-cache", default=None,
+        help="Path to a JSON file for caching the semi-inductive split (unseen "
+             "node names) per seed. On first call for a given seed the split is "
+             "saved here; subsequent calls (e.g. TGAT, STHN running after RGCN) "
+             "load it instead of resampling, guaranteeing all models share "
+             "identical train/test splits."
+    )
     args = parser.parse_args()
 
     # Auto-load tuned hyperparameters from best_params.json if it exists.
@@ -480,20 +478,38 @@ def main():
     print(f"[main] epochs={args.epochs}  hidden={args.hidden}  "
           f"lr={args.lr}  n_order_bins={args.n_order_bins}")
 
+    # Unique order modes across all conditions — build_dataset is called once
+    # per (seed, order_mode) and the FISHData is shared across conditions that
+    # differ only in architecture / time / compartment. This guarantees that all
+    # conditions at the same seed use IDENTICAL train/test masks.
+    order_modes = list(dict.fromkeys(c.order_mode for c in CONDITIONS))
+
     results = []
-    for ci, condition in enumerate(CONDITIONS, 1):
-        for seed in range(args.seeds):
-            run_idx = (ci - 1) * args.seeds + seed + 1
+    run_idx = 0
+    for seed in range(args.seeds):
+        data_for_mode = {
+            mode: build_dataset(
+                G,
+                split="semi_inductive",
+                unseen_node_frac=0.20,
+                order_mode=mode,
+                n_order_bins=args.n_order_bins,
+                compartment_embeddings=compartment_embeddings,
+                time_target=args.time_target,
+                split_cache=args.split_cache,
+                seed=seed,
+            )
+            for mode in order_modes
+        }
+        for condition in CONDITIONS:
+            run_idx += 1
             print(f"\n[{run_idx}/{n_runs}] {condition.name}  seed={seed}")
             m = run_one(
-                G, condition, seed,
+                G, condition, data_for_mode[condition.order_mode], seed,
                 epochs=args.epochs, hidden=args.hidden,
                 n_layers=args.n_layers, lr=args.lr,
                 n_order_bins=args.n_order_bins, time_dim=args.time_dim,
                 device=device,
-                compartment_embeddings=(
-                    compartment_embeddings if condition.use_compartment else None
-                ),
                 verbose=args.verbose,
                 compute_hits=args.hits,
                 smart_train=args.smart_train,

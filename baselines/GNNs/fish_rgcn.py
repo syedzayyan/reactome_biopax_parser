@@ -211,6 +211,7 @@ def build_dataset(
     compartment_dim: int = 32,
     force_unseen: Optional[list] = None,
     time_target: str = "min_max",
+    split_cache: Optional[str] = None,
     seed: int = 0,
 ) -> FISHData:
     """
@@ -329,8 +330,43 @@ def build_dataset(
         # discarded since they cannot be scored against any training context.
         n_total_nodes = len(nodes)
         n_unseen = int(round(unseen_node_frac * n_total_nodes))
-        perm = rng.permutation(n_total_nodes)
-        unseen_ids = set(perm[:n_unseen].tolist())
+
+        # Load or save the unseen-node set via a shared cache file so that
+        # separate model scripts (RGCN, TGAT, STHN) use identical splits.
+        # Cache is skipped when force_unseen is set (caller controls the set).
+        # Node names (not indices) are stored so the cache survives graph
+        # reloads where insertion order might vary across Python runs.
+        unseen_ids: Optional[set] = None
+        if split_cache is not None and not force_unseen:
+            import json as _json, pathlib as _pathlib
+            _cache_path = _pathlib.Path(split_cache)
+            if _cache_path.exists():
+                _cached = _json.loads(_cache_path.read_text())
+                _seed_key = str(seed)
+                if _seed_key in _cached:
+                    _missing = [_n for _n in _cached[_seed_key] if _n not in node_to_id]
+                    if _missing:
+                        raise KeyError(
+                            f"split_cache seed={seed}: {len(_missing)} node(s) not found "
+                            f"in current graph (first: {_missing[0]!r}). "
+                            f"Ensure all models parse the same BioPAX / pickle."
+                        )
+                    unseen_ids = {node_to_id[_n] for _n in _cached[_seed_key]}
+                    print(f"[build_dataset] Loaded split for seed={seed} from {split_cache}")
+
+        if unseen_ids is None:
+            perm = rng.permutation(n_total_nodes)
+            unseen_ids = set(perm[:n_unseen].tolist())
+            if split_cache is not None and not force_unseen:
+                import json as _json, pathlib as _pathlib
+                _cache_path = _pathlib.Path(split_cache)
+                _cache_path.parent.mkdir(parents=True, exist_ok=True)
+                _existing: dict = {}
+                if _cache_path.exists():
+                    _existing = _json.loads(_cache_path.read_text())
+                _existing[str(seed)] = [str(nodes[i]) for i in sorted(unseen_ids)]
+                _cache_path.write_text(_json.dumps(_existing, indent=2))
+                print(f"[build_dataset] Saved split for seed={seed} to {split_cache}")
 
         # Union in any explicitly-requested nodes (e.g. case-study targets).
         # If a name doesn't resolve, raise — silently dropping a case-study

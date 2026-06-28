@@ -12,6 +12,10 @@
 cd reactome_biopax_parser
 source .venv/bin/activate
 
+# Reduces CUDA allocator fragmentation; helps when evaluation batches
+# request large contiguous blocks after a training run has fragmented the pool.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 # Tunes + benchmarks RGCN, TGAT and STHN on all 5 pathways (Immune, Cell
 # Cycle, Hemostasis, Metabolism, Gene Expression) for a direct three-way
 # comparison. --time-ablation adds the no-time-encoding variants for both
