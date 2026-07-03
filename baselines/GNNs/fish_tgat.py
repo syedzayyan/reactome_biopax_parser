@@ -101,7 +101,8 @@ def _build_neighbor_table(
     etype_tr = data.all_type[data.train_mask].cpu().numpy()
     time_tr = data.all_time[data.train_mask].cpu().numpy().astype(np.float32)
 
-    t_max = float(data.all_time.max())
+    # Use training-only max to avoid normalisation dependency on test-edge times.
+    t_max = float(time_tr.max())
     if t_max <= 0.0:
         t_max = 1.0
     time_norm = (time_tr / t_max).astype(np.float32)
@@ -406,33 +407,99 @@ class FISHTGAT(nn.Module):
         return h
 
     def encode(self, data: FISHData) -> torch.Tensor:
-        """Return node embeddings of shape (N, hidden)."""
+        """Return initial node feature projections (N, hidden).
+
+        The neighbour table (training edges only, sorted by time desc) is
+        cached here. Temporal attention with causal masking is applied per
+        query in encode_pair_side rather than globally, so that each pair
+        (src, dst, t) sees only neighbours with edge_time < t.
+        """
         device = next(self.parameters()).device
         if self._nbr_ids is None or self._nbr_ids.device != device:
             (self._nbr_ids, self._nbr_types, self._nbr_times,
              self._nbr_valid, self._nbr_ref) = _build_neighbor_table(
                 data, self.max_neighbors, device
             )
-        h_init = self._project_inputs(data, device)
-        return self.tgat_encoder(
-            h_init,
-            self._nbr_ids, self._nbr_types, self._nbr_times,
-            self._nbr_valid, self._nbr_ref,
-        )
+        return self._project_inputs(data, device)
+
+    def encode_pair_side(
+        self,
+        nodes: torch.Tensor,       # (B,) node indices
+        t_query: torch.Tensor,     # (B,) normalised query timestamps
+        h_init: torch.Tensor,      # (N, hidden) initial feature projections
+    ) -> torch.Tensor:
+        """Compute per-node temporal embeddings for a batch of (node, t_query) pairs.
+
+        For each query node v at time t_query[i], only training neighbours with
+        edge_time < t_query[i] are included (causal masking). Time deltas are
+        t_query - edge_time so the reference is the actual query time, not the
+        per-node training-edge maximum.
+
+        For n_layers > 1, neighbour features at every layer come from h_init
+        (the initial projection). This is exact for n_layers=1 and a 1-hop
+        faithful approximation for n_layers=2, avoiding the exponential cost
+        of full temporal recursion.
+        """
+        nbr_ids_b   = self._nbr_ids[nodes]    # (B, K)
+        nbr_types_b = self._nbr_types[nodes]  # (B, K)
+        nbr_times_b = self._nbr_times[nodes]  # (B, K) normalised
+        nbr_valid_b = self._nbr_valid[nodes]  # (B, K) bool
+
+        # Causal filter: tj < t_query.
+        t_q = t_query.unsqueeze(1)            # (B, 1)
+        causal_valid = nbr_valid_b & (nbr_times_b < t_q)
+
+        if not self.tgat_encoder.use_time_encoding:
+            t_q_enc = torch.zeros_like(t_query)
+            time_diffs = torch.zeros_like(nbr_times_b)
+        else:
+            t_q_enc = t_query
+            time_diffs = (t_q - nbr_times_b).clamp(min=0.0) * causal_valid.float()
+
+        time_feat = self.tgat_encoder.time_encoder(t_q_enc)  # (B, time_dim)
+
+        h = h_init[nodes]   # (B, hidden) — starting point for each query node
+        for attn, merge in zip(self.tgat_encoder.attn_layers,
+                                self.tgat_encoder.merge_layers):
+            # Neighbour features always from h_init (avoids 2-hop recursion cost).
+            nbr_node_feat = h_init[nbr_ids_b] * causal_valid.unsqueeze(-1).float()
+            edge_feat = (
+                self.tgat_encoder.edge_type_emb(nbr_types_b)
+                * causal_valid.unsqueeze(-1).float()
+            )
+            nbr_time_feat = (
+                self.tgat_encoder.time_encoder(time_diffs)
+                .reshape(*time_diffs.shape, -1)
+                * causal_valid.unsqueeze(-1).float()
+            )
+            h_attn = attn(
+                node_feat=h,
+                time_feat=time_feat,
+                edge_feat=edge_feat,
+                nbr_node_feat=nbr_node_feat,
+                nbr_time_feat=nbr_time_feat,
+                valid_nbr_mask=causal_valid,
+            )
+            h = merge(torch.cat([h_attn, h_init[nodes]], dim=-1))
+            h = F.dropout(h, p=self.tgat_encoder.dropout, training=self.training)
+        return h  # (B, hidden)
 
     # ── heads ────────────────────────────────────────────────────────────────
 
-    def _pair_repr(self, h, src, dst):
-        return torch.cat([h[src], h[dst]], dim=-1)
+    def _pair_repr(self, h_init, src, dst, t_query):
+        """Compute temporally-causal pair representation for (B,) query pairs."""
+        h_src = self.encode_pair_side(src, t_query, h_init)  # (B, hidden)
+        h_dst = self.encode_pair_side(dst, t_query, h_init)  # (B, hidden)
+        return torch.cat([h_src, h_dst], dim=-1)              # (B, 2*hidden)
 
-    def existence_logit(self, h, src, dst):
-        return self.head_exist(self._pair_repr(h, src, dst)).squeeze(-1)
+    def existence_logit(self, h_init, src, dst, t_query):
+        return self.head_exist(self._pair_repr(h_init, src, dst, t_query)).squeeze(-1)
 
-    def type_logits(self, h, src, dst):
-        return self.head_type(self._pair_repr(h, src, dst))
+    def type_logits(self, h_init, src, dst, t_query):
+        return self.head_type(self._pair_repr(h_init, src, dst, t_query))
 
-    def order_output(self, h, src, dst):
-        return self.head_order(self._pair_repr(h, src, dst))
+    def order_output(self, h_init, src, dst, t_query):
+        return self.head_order(self._pair_repr(h_init, src, dst, t_query))
 
 
 # ── training ─────────────────────────────────────────────────────────────────
@@ -458,6 +525,11 @@ def train(
     typ_tr = data.all_type[data.train_mask].to(device)
     bin_tr = (data.order_bin[data.train_mask].to(device)
               if data.order_bin is not None else None)
+    # Normalised training-edge timestamps — same scale as the neighbour table.
+    _t_max_tr = float(data.all_time[data.train_mask].max())
+    if _t_max_tr <= 0.0:
+        _t_max_tr = 1.0
+    time_tr = (data.all_time[data.train_mask].float().to(device) / _t_max_tr).clamp(min=0.0)
 
     coral_levels = None
     if model.order_mode == "coral" and bin_tr is not None:
@@ -473,10 +545,14 @@ def train(
     for epoch in range(1, epochs + 1):
         model.train()
         opt.zero_grad()
-        h = model.encode(data)
+        # encode() now returns h_init (feature projections only); temporal
+        # attention with causal filtering is applied per-query inside each head.
+        h_init = model.encode(data)
 
         # 1) Existence: positives + K negatives per positive.
-        pos_logit = model.existence_logit(h, src_tr, dst_tr)
+        # Negatives share the same t_query as their positive counterpart (we ask
+        # "at time t_positive, does this random edge exist?").
+        pos_logit = model.existence_logit(h_init, src_tr, dst_tr, time_tr)
         if model.smart_negatives and train_neg_state is not None:
             negs = _sample_train_smart_negatives(
                 src_tr, dst_tr, train_neg_state, model.n_negatives,
@@ -486,18 +562,19 @@ def train(
                 data, src_tr, model.n_negatives, data.n_nodes, device,
             )
         src_rep = src_tr.repeat_interleave(model.n_negatives)
-        neg_logit = model.existence_logit(h, src_rep, negs.reshape(-1))
+        time_tr_rep = time_tr.repeat_interleave(model.n_negatives)
+        neg_logit = model.existence_logit(h_init, src_rep, negs.reshape(-1), time_tr_rep)
         loss_exist = F.binary_cross_entropy_with_logits(
             torch.cat([pos_logit, neg_logit]),
             torch.cat([torch.ones_like(pos_logit), torch.zeros_like(neg_logit)]),
         )
 
         # 2) Type: cross-entropy on positives.
-        type_lgt = model.type_logits(h, src_tr, dst_tr)
+        type_lgt = model.type_logits(h_init, src_tr, dst_tr, time_tr)
         loss_type = F.cross_entropy(type_lgt, typ_tr)
 
         # 3) Order: regression, CORN, or CORAL.
-        out_order = model.order_output(h, src_tr, dst_tr)
+        out_order = model.order_output(h_init, src_tr, dst_tr, time_tr)
         if model.order_mode == "regression":
             loss_order = F.mse_loss(out_order.squeeze(-1), order_target_tr)
         elif model.order_mode == "corn":
@@ -529,6 +606,129 @@ def train(
 # ── evaluation ───────────────────────────────────────────────────────────────
 
 
+@torch.no_grad()
+def _score_edge_set_temporal(
+    model: FISHTGAT,
+    data: FISHData,
+    h_init: torch.Tensor,
+    mask: torch.Tensor,
+    n_neg_per_pos: int,
+    device,
+    seed: int,
+    neg_state=None,
+) -> dict:
+    """Score edges selected by ``mask`` using per-query causal temporal filtering.
+
+    Each pair (src, dst, t) uses only training neighbours with edge_time < t,
+    with t as the ref_time for temporal attention. Mirrors _score_edge_set from
+    fish_rgcn but threads t_query through every model call.
+    """
+    from sklearn.metrics import roc_auc_score
+    from scipy.stats import spearmanr
+    from coral_pytorch.dataset import corn_label_from_logits as _corn_label_from_logits
+
+    nan = float("nan")
+    empty: dict = {
+        "exist_auc": nan, "exist_auc_smart": nan,
+        "type_macro_auc": nan, "type_top1": nan,
+        "type_majority_baseline": nan, "type_classes_in_test": [],
+        "type_classes_missing_from_test": list(range(data.n_edge_types)),
+        "order_spearman": nan, "order_pairwise_acc": nan,
+        "n_edges": 0, "mrr": nan, "mrr_type": nan,
+    }
+    if int(mask.sum()) == 0:
+        return empty
+
+    src = data.all_src[mask].to(device)
+    dst = data.all_dst[mask].to(device)
+    typ = data.all_type[mask].to(device)
+    times = data.all_time[mask].to(device)
+
+    t_max_tr = float(data.all_time[data.train_mask].max())
+    if t_max_tr <= 0.0:
+        t_max_tr = 1.0
+    t_query = (times.float() / t_max_tr).clamp(min=0.0)
+
+    g = torch.Generator(device=device).manual_seed(seed)
+    pos_logit = model.existence_logit(h_init, src, dst, t_query)
+    src_rep = src.repeat_interleave(n_neg_per_pos)
+    t_query_rep = t_query.repeat_interleave(n_neg_per_pos)
+    neg_dst_rnd = torch.randint(
+        0, data.n_nodes, (src.numel() * n_neg_per_pos,), generator=g, device=device,
+    )
+    neg_logit_rnd = model.existence_logit(h_init, src_rep, neg_dst_rnd, t_query_rep)
+    y_r = torch.cat([torch.ones_like(pos_logit), torch.zeros_like(neg_logit_rnd)]).cpu().numpy()
+    s_r = torch.cat([pos_logit, neg_logit_rnd]).cpu().numpy()
+    exist_auc = float(roc_auc_score(y_r, s_r))
+
+    exist_auc_smart = nan
+    if neg_state is not None:
+        rng = np.random.default_rng(seed + 12345)
+        node_type_np = data.node_type.cpu().numpy()
+        smart_neg_np = _sample_smart_negatives(
+            src.cpu().numpy(), dst.cpu().numpy(), typ.cpu().numpy(),
+            neg_state, n_neg_per_pos, data.n_nodes, rng,
+            node_type_of_dst=node_type_np,
+        )
+        smart_neg = torch.from_numpy(smart_neg_np).to(device).reshape(-1)
+        neg_logit_smt = model.existence_logit(h_init, src_rep, smart_neg, t_query_rep)
+        y_s = torch.cat([torch.ones_like(pos_logit), torch.zeros_like(neg_logit_smt)]).cpu().numpy()
+        s_s = torch.cat([pos_logit, neg_logit_smt]).cpu().numpy()
+        exist_auc_smart = float(roc_auc_score(y_s, s_s))
+
+    type_lgt_np = model.type_logits(h_init, src, dst, t_query).cpu().numpy()
+    type_true = typ.cpu().numpy()
+    present_cls = np.unique(type_true)
+    type_auc = nan
+    type_auc_classes: list[int] = []
+    if len(present_cls) >= 2:
+        try:
+            sub_lgt = type_lgt_np[:, present_cls]
+            oh = (type_true[:, None] == present_cls[None, :]).astype(int)
+            type_auc = float(roc_auc_score(oh, sub_lgt, average="macro", multi_class="ovr"))
+            type_auc_classes = [int(c) for c in present_cls]
+        except ValueError:
+            pass
+    type_top1 = float((type_lgt_np.argmax(axis=1) == type_true).mean())
+    if len(type_true) > 0:
+        counts = np.bincount(type_true, minlength=data.n_edge_types)
+        type_majority = float(counts.max() / counts.sum())
+    else:
+        type_majority = nan
+
+    out_ord = model.order_output(h_init, src, dst, t_query)
+    if model.order_mode == "regression":
+        score = out_ord.squeeze(-1).cpu().numpy()
+    elif model.order_mode == "corn":
+        score = _corn_label_from_logits(out_ord).cpu().numpy().astype(float)
+    else:
+        score = (torch.sigmoid(out_ord) > 0.5).sum(dim=-1).cpu().numpy().astype(float)
+    target = times.cpu().numpy()
+    rho = float(spearmanr(score, target).statistic) if len(score) > 1 else nan
+    rng2 = np.random.default_rng(seed)
+    n_pairs = min(50_000, len(score) * (len(score) - 1) // 2)
+    if n_pairs >= 1:
+        ii = rng2.integers(0, len(score), n_pairs)
+        jj = rng2.integers(0, len(score), n_pairs)
+        keep = (ii != jj) & (target[ii] != target[jj])
+        ii, jj = ii[keep], jj[keep]
+        pairwise = float(((target[ii] < target[jj]) == (score[ii] < score[jj])).mean())
+    else:
+        pairwise = nan
+
+    return {
+        "exist_auc": exist_auc, "exist_auc_smart": exist_auc_smart,
+        "type_macro_auc": type_auc, "type_top1": type_top1,
+        "type_majority_baseline": type_majority,
+        "type_classes_in_test": type_auc_classes,
+        "type_classes_missing_from_test": [
+            int(c) for c in range(data.n_edge_types) if c not in present_cls
+        ],
+        "order_spearman": rho, "order_pairwise_acc": pairwise,
+        "n_edges": int(mask.sum()), "mrr": nan, "mrr_type": nan,
+    }
+
+
 def evaluate(
     model: FISHTGAT,
     data: FISHData,
@@ -539,16 +739,52 @@ def evaluate(
     hits_ks: tuple[int, ...] = (1, 10, 100),
     hits_batch: int = 2048,
 ) -> dict:
-    """
-    Compute the three task metrics on the held-out test set(s).
+    """Compute the three task metrics on the held-out test set(s).
 
-    Delegates to the shared _evaluate_impl from fish_rgcn so metrics are
-    directly comparable across RGCN and TGAT baselines.
+    Uses per-query temporal causality: each pair (src, dst, t) sees only
+    training neighbours with edge_time < t, making TGAT fully faithful to its
+    design. For n_layers > 1, neighbour features at all TGAT layers come from
+    h_init (exact for n_layers=1, 1-hop faithful for n_layers=2).
     """
     with torch.no_grad():
-        return _evaluate_impl(
-            model, data, n_neg_per_pos, device, seed,
-            compute_hits=compute_hits,
-            hits_ks=hits_ks,
-            hits_batch=hits_batch,
+        device = device or next(model.parameters()).device
+        model.eval()
+        h_init = model.encode(data)
+        neg_state = _build_negative_sampler_state(data)
+
+        primary = _score_edge_set_temporal(
+            model, data, h_init, data.test_mask, n_neg_per_pos, device, seed,
+            neg_state=neg_state,
         )
+        out: dict = dict(primary)
+        out["n_test_edges"] = primary["n_edges"]
+
+        if data.inductive_mask is not None and int(data.inductive_mask.sum()) > 0:
+            inductive = _score_edge_set_temporal(
+                model, data, h_init, data.inductive_mask, n_neg_per_pos, device, seed + 1,
+                neg_state=neg_state,
+            )
+            for k, v in inductive.items():
+                out[f"ind_{k}"] = v
+        else:
+            out["ind_exist_auc"] = float("nan")
+            out["ind_exist_auc_smart"] = float("nan")
+            out["ind_type_top1"] = float("nan")
+            out["ind_order_pairwise_acc"] = float("nan")
+            out["ind_n_edges"] = 0
+
+        seen_nodes = set(data.all_src[data.train_mask].cpu().numpy().tolist())
+        seen_nodes |= set(data.all_dst[data.train_mask].cpu().numpy().tolist())
+        src_np = data.all_src[data.test_mask].cpu().numpy()
+        dst_np = data.all_dst[data.test_mask].cpu().numpy()
+        out["test_both_endpoints_seen"] = sum(
+            1 for s, d in zip(src_np, dst_np) if s in seen_nodes and d in seen_nodes
+        )
+        out["test_one_endpoint_seen"] = sum(
+            1 for s, d in zip(src_np, dst_np)
+            if (s in seen_nodes) != (d in seen_nodes)
+        )
+        out["test_neither_endpoint_seen"] = (
+            len(src_np) - out["test_both_endpoints_seen"] - out["test_one_endpoint_seen"]
+        )
+        return out
