@@ -514,6 +514,7 @@ def train(
     loss_weights: tuple[float, float, float] = (1.0, 1.0, 1.0),
     device: Optional[str] = None,
     log_every: int = 20,
+    neg_chunk_size: int = 5_000,
 ) -> dict:
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -563,7 +564,20 @@ def train(
             )
         src_rep = src_tr.repeat_interleave(model.n_negatives)
         time_tr_rep = time_tr.repeat_interleave(model.n_negatives)
-        neg_logit = model.existence_logit(h_init, src_rep, negs.reshape(-1), time_tr_rep)
+        # Chunk negatives to avoid allocating (N_neg, max_neighbors, hidden)
+        # all at once — at hidden=256 that's ~5-6 GB for 280K negatives.
+        # torch.cat preserves the gradient graph so backward() is unaffected.
+        negs_flat = negs.reshape(-1)
+        neg_chunks = [
+            model.existence_logit(
+                h_init,
+                src_rep[s:s + neg_chunk_size],
+                negs_flat[s:s + neg_chunk_size],
+                time_tr_rep[s:s + neg_chunk_size],
+            )
+            for s in range(0, src_rep.numel(), neg_chunk_size)
+        ]
+        neg_logit = torch.cat(neg_chunks)
         loss_exist = F.binary_cross_entropy_with_logits(
             torch.cat([pos_logit, neg_logit]),
             torch.cat([torch.ones_like(pos_logit), torch.zeros_like(neg_logit)]),
