@@ -556,6 +556,7 @@ def _hits_at_k_sthn(
     h: torch.Tensor,
     src: torch.Tensor,
     dst: torch.Tensor,
+    t_query: torch.Tensor,
     candidate_pool: torch.Tensor,
     n_nodes_total: int,
     ks: tuple[int, ...] = (1, 10, 100),
@@ -620,7 +621,8 @@ def _hits_at_k_sthn(
 
         src_rep = sub_src.unsqueeze(1).expand(B, n_block).reshape(-1)
         cand_rep = cand_block.reshape(-1)
-        logits = model.existence_logit(h, src_rep, cand_rep).view(B, n_block)
+        t_rep = t_query[start:end].unsqueeze(1).expand(B, n_block).reshape(-1)
+        logits = model.existence_logit(h, src_rep, cand_rep, t_rep).view(B, n_block)
 
         true_scores = logits[:, 0]
         ranks = (logits > true_scores.unsqueeze(1)).sum(dim=1) + 1
@@ -648,15 +650,17 @@ def _score_edge_set_temporal(
     device,
     seed: int,
     neg_state=None,
+    compute_hits: bool = False,
+    hits_ks: tuple[int, ...] = (1, 10, 100),
+    hits_batch: int = 9_000,
 ) -> dict:
     """Score a set of edges selected by ``mask`` using per-query t_query.
 
     Mirrors _score_edge_set from fish_rgcn but passes the edge's own
     normalised timestamp as t_query to every model call so that only training
     neighbours with t_j < t_query contribute to each pair representation.
-    Hits@K is not computed here (always nan) because _hits_at_k_sthn would
-    need an analogous per-query t_query that varies across the candidate block,
-    which isn't supported; the tune scripts use compute_hits=False.
+    When compute_hits=True, computes exact full-pool Hits@K/MRR via
+    _hits_at_k_sthn (ranks against all data.n_nodes candidate destinations).
     """
     from sklearn.metrics import roc_auc_score
     from scipy.stats import spearmanr
@@ -755,6 +759,18 @@ def _score_edge_set_temporal(
     else:
         pairwise = nan
 
+    mrr: float = nan
+    hits_dict: dict = {}
+    if compute_hits and src.numel() > 0:
+        candidate_pool = torch.arange(data.n_nodes, device=device)
+        hk = _hits_at_k_sthn(
+            model, h, src, dst, t_query, candidate_pool, data.n_nodes,
+            ks=hits_ks, dyads_per_chunk=hits_batch,
+            max_candidates=data.n_nodes,  # exact full-pool ranking
+        )
+        mrr = hk.pop("mrr")
+        hits_dict = {f"hits_at_{k}": hk[k] for k in hits_ks}
+
     return {
         "exist_auc": exist_auc,
         "exist_auc_smart": exist_auc_smart,
@@ -768,7 +784,8 @@ def _score_edge_set_temporal(
         "order_spearman": rho,
         "order_pairwise_acc": pairwise,
         "n_edges": int(mask.sum()),
-        "mrr": nan, "mrr_type": nan,
+        "mrr": mrr, "mrr_type": nan,
+        **hits_dict,
     }
 
 
@@ -781,7 +798,6 @@ def evaluate(
     compute_hits: bool = False,
     hits_ks: tuple[int, ...] = (1, 10, 100),
     hits_batch: int = 9_000,
-    max_hits_candidates: int = 300,
 ) -> dict:
     """Compute the three task metrics on the held-out test set(s).
 
@@ -795,9 +811,13 @@ def evaluate(
         h = model.encode(data)
         neg_state = _build_negative_sampler_state(data)
 
+        _hits_kw = dict(
+            compute_hits=compute_hits, hits_ks=hits_ks,
+            hits_batch=hits_batch,
+        )
         primary = _score_edge_set_temporal(
             model, data, h, data.test_mask, n_neg_per_pos, device, seed,
-            neg_state=neg_state,
+            neg_state=neg_state, **_hits_kw,
         )
         out: dict = dict(primary)
         out["n_test_edges"] = primary["n_edges"]
@@ -805,7 +825,7 @@ def evaluate(
         if data.inductive_mask is not None and int(data.inductive_mask.sum()) > 0:
             inductive = _score_edge_set_temporal(
                 model, data, h, data.inductive_mask, n_neg_per_pos, device, seed + 1,
-                neg_state=neg_state,
+                neg_state=neg_state, **_hits_kw,
             )
             for k, v in inductive.items():
                 out[f"ind_{k}"] = v

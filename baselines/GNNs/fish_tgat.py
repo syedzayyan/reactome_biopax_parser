@@ -607,6 +607,76 @@ def train(
 
 
 @torch.no_grad()
+@torch.no_grad()
+def _hits_at_k_tgat(
+    model: "FISHTGAT",
+    h_init: torch.Tensor,
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    t_query: torch.Tensor,
+    candidate_pool: torch.Tensor,
+    n_nodes_total: int,
+    ks: tuple[int, ...] = (1, 10, 100),
+    dyads_per_chunk: int = 2_048,
+    max_candidates: int = 300,
+) -> dict:
+    """Approximate Hits@K / MRR for TGAT (mirrors _hits_at_k_sthn).
+
+    For each positive (src, dst, t_query) builds a candidate block of size
+    min(max_candidates, |pool|): true dst at position 0, the rest sampled
+    uniformly from candidate_pool. Both endpoints are embedded per-query via
+    encode_pair_side so causal masking is respected.
+    """
+    n_pos = src.numel()
+    n_cand = candidate_pool.numel()
+    if n_pos == 0 or n_cand == 0:
+        out: dict = {k: float("nan") for k in ks}
+        out["mrr"] = float("nan")
+        return out
+
+    n_block = min(max_candidates, n_cand)
+    n_extra = max(n_block - 1, 0)
+    batch_size = max(1, dyads_per_chunk // max(n_block, 1))
+
+    hits = {k: 0 for k in ks}
+    rr_sum = 0.0
+    scored = 0
+
+    for start in range(0, n_pos, batch_size):
+        end = min(start + batch_size, n_pos)
+        sub_src = src[start:end]
+        sub_dst = dst[start:end]
+        sub_tq = t_query[start:end]
+        B = sub_src.numel()
+
+        if n_extra > 0:
+            rand_idx = torch.randint(0, n_cand, (B, n_extra), device=h_init.device)
+            rand_cands = candidate_pool[rand_idx]
+            cand_block = torch.cat([sub_dst.unsqueeze(1), rand_cands], dim=1)
+        else:
+            cand_block = sub_dst.unsqueeze(1)
+
+        src_rep = sub_src.unsqueeze(1).expand(B, n_block).reshape(-1)
+        cand_rep = cand_block.reshape(-1)
+        t_rep = sub_tq.unsqueeze(1).expand(B, n_block).reshape(-1)
+        logits = model.existence_logit(h_init, src_rep, cand_rep, t_rep).view(B, n_block)
+
+        true_scores = logits[:, 0]
+        ranks = (logits > true_scores.unsqueeze(1)).sum(dim=1) + 1
+        for k in ks:
+            hits[k] += int((ranks <= k).sum().item())
+        rr_sum += float((1.0 / ranks.float()).sum().item())
+        scored += B
+
+    if scored == 0:
+        out = {k: float("nan") for k in ks}
+        out["mrr"] = float("nan")
+        return out
+    out = {k: hits[k] / scored for k in ks}
+    out["mrr"] = rr_sum / scored
+    return out
+
+
 def _score_edge_set_temporal(
     model: FISHTGAT,
     data: FISHData,
@@ -616,6 +686,9 @@ def _score_edge_set_temporal(
     device,
     seed: int,
     neg_state=None,
+    compute_hits: bool = False,
+    hits_ks: tuple[int, ...] = (1, 10, 100),
+    hits_batch: int = 2_048,
 ) -> dict:
     """Score edges selected by ``mask`` using per-query causal temporal filtering.
 
@@ -716,6 +789,18 @@ def _score_edge_set_temporal(
     else:
         pairwise = nan
 
+    mrr: float = nan
+    hits_dict: dict = {}
+    if compute_hits and src.numel() > 0:
+        candidate_pool = torch.arange(data.n_nodes, device=device)
+        hk = _hits_at_k_tgat(
+            model, h_init, src, dst, t_query, candidate_pool, data.n_nodes,
+            ks=hits_ks, dyads_per_chunk=hits_batch,
+            max_candidates=data.n_nodes,  # exact full-pool ranking
+        )
+        mrr = hk.pop("mrr")
+        hits_dict = {f"hits_at_{k}": hk[k] for k in hits_ks}
+
     return {
         "exist_auc": exist_auc, "exist_auc_smart": exist_auc_smart,
         "type_macro_auc": type_auc, "type_top1": type_top1,
@@ -725,7 +810,8 @@ def _score_edge_set_temporal(
             int(c) for c in range(data.n_edge_types) if c not in present_cls
         ],
         "order_spearman": rho, "order_pairwise_acc": pairwise,
-        "n_edges": int(mask.sum()), "mrr": nan, "mrr_type": nan,
+        "n_edges": int(mask.sum()), "mrr": mrr, "mrr_type": nan,
+        **hits_dict,
     }
 
 
@@ -752,9 +838,13 @@ def evaluate(
         h_init = model.encode(data)
         neg_state = _build_negative_sampler_state(data)
 
+        _hits_kw = dict(
+            compute_hits=compute_hits, hits_ks=hits_ks,
+            hits_batch=hits_batch,
+        )
         primary = _score_edge_set_temporal(
             model, data, h_init, data.test_mask, n_neg_per_pos, device, seed,
-            neg_state=neg_state,
+            neg_state=neg_state, **_hits_kw,
         )
         out: dict = dict(primary)
         out["n_test_edges"] = primary["n_edges"]
@@ -762,7 +852,7 @@ def evaluate(
         if data.inductive_mask is not None and int(data.inductive_mask.sum()) > 0:
             inductive = _score_edge_set_temporal(
                 model, data, h_init, data.inductive_mask, n_neg_per_pos, device, seed + 1,
-                neg_state=neg_state,
+                neg_state=neg_state, **_hits_kw,
             )
             for k, v in inductive.items():
                 out[f"ind_{k}"] = v
