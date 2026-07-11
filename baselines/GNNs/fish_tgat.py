@@ -550,10 +550,16 @@ def train(
         # attention with causal filtering is applied per-query inside each head.
         h_init = model.encode(data)
 
+        # Encode src and dst once and share across all three heads.
+        # Original code called encode_pair_side 6× per epoch on the same
+        # (src_tr, dst_tr, time_tr) inputs (existence + type + order each
+        # called _pair_repr internally). This reduces that to 2 calls.
+        h_src_pos = model.encode_pair_side(src_tr, time_tr, h_init)
+        h_dst_pos = model.encode_pair_side(dst_tr, time_tr, h_init)
+        pair_pos = torch.cat([h_src_pos, h_dst_pos], dim=-1)
+
         # 1) Existence: positives + K negatives per positive.
-        # Negatives share the same t_query as their positive counterpart (we ask
-        # "at time t_positive, does this random edge exist?").
-        pos_logit = model.existence_logit(h_init, src_tr, dst_tr, time_tr)
+        pos_logit = model.head_exist(pair_pos).squeeze(-1)
         if model.smart_negatives and train_neg_state is not None:
             negs = _sample_train_smart_negatives(
                 src_tr, dst_tr, train_neg_state, model.n_negatives,
@@ -562,20 +568,21 @@ def train(
             negs = _sample_negatives(
                 data, src_tr, model.n_negatives, data.n_nodes, device,
             )
-        src_rep = src_tr.repeat_interleave(model.n_negatives)
         time_tr_rep = time_tr.repeat_interleave(model.n_negatives)
-        # Chunk negatives to avoid allocating (N_neg, max_neighbors, hidden)
-        # all at once — at hidden=256 that's ~5-6 GB for 280K negatives.
-        # torch.cat preserves the gradient graph so backward() is unaffected.
+        # Reuse h_src_pos for all K negatives per positive — encode only the
+        # negative dst nodes in chunks (not src again).
+        h_src_rep = h_src_pos.repeat_interleave(model.n_negatives, dim=0)
         negs_flat = negs.reshape(-1)
         neg_chunks = [
-            model.existence_logit(
-                h_init,
-                src_rep[s:s + neg_chunk_size],
-                negs_flat[s:s + neg_chunk_size],
-                time_tr_rep[s:s + neg_chunk_size],
-            )
-            for s in range(0, src_rep.numel(), neg_chunk_size)
+            model.head_exist(torch.cat([
+                h_src_rep[s:s + neg_chunk_size],
+                model.encode_pair_side(
+                    negs_flat[s:s + neg_chunk_size],
+                    time_tr_rep[s:s + neg_chunk_size],
+                    h_init,
+                ),
+            ], dim=-1)).squeeze(-1)
+            for s in range(0, negs_flat.numel(), neg_chunk_size)
         ]
         neg_logit = torch.cat(neg_chunks)
         loss_exist = F.binary_cross_entropy_with_logits(
@@ -583,12 +590,12 @@ def train(
             torch.cat([torch.ones_like(pos_logit), torch.zeros_like(neg_logit)]),
         )
 
-        # 2) Type: cross-entropy on positives.
-        type_lgt = model.type_logits(h_init, src_tr, dst_tr, time_tr)
+        # 2) Type: reuse pair_pos.
+        type_lgt = model.head_type(pair_pos)
         loss_type = F.cross_entropy(type_lgt, typ_tr)
 
-        # 3) Order: regression, CORN, or CORAL.
-        out_order = model.order_output(h_init, src_tr, dst_tr, time_tr)
+        # 3) Order: reuse pair_pos.
+        out_order = model.head_order(pair_pos)
         if model.order_mode == "regression":
             loss_order = F.mse_loss(out_order.squeeze(-1), order_target_tr)
         elif model.order_mode == "corn":
@@ -631,7 +638,7 @@ def _hits_at_k_tgat(
     candidate_pool: torch.Tensor,
     n_nodes_total: int,
     ks: tuple[int, ...] = (1, 10, 100),
-    dyads_per_chunk: int = 2_048,
+    dyads_per_chunk: int = 50_000,
     max_candidates: int = 300,
 ) -> dict:
     """Hits@K / MRR for TGAT.
@@ -849,7 +856,7 @@ def evaluate(
     seed: int = 0,
     compute_hits: bool = False,
     hits_ks: tuple[int, ...] = (1, 10, 100),
-    hits_batch: int = 2048,
+    hits_batch: int = 50_000,
 ) -> dict:
     """Compute the three task metrics on the held-out test set(s).
 
