@@ -564,32 +564,19 @@ def _hits_at_k_sthn(
     max_candidates: int = 300,
 ) -> dict:
     """
-    Approximate Hits@K / MRR for STHN.
+    Hits@K / MRR for STHN.
 
-    _hits_at_k (fish_rgcn) assumes a cached (N, hidden) embedding table and
-    scores every candidate via a single MLP on cat([h[src], h[cand]]).
-    STHN has no such table — each (src, cand) pair needs its own subgraph
-    extraction + mixer forward, so scoring the full candidate pool (often
-    thousands of nodes) per positive is infeasible.
+    When max_candidates >= |candidate_pool| (full-pool mode): scores every
+    candidate node exhaustively. candidate_pool must be torch.arange(n_nodes)
+    so that pool[j] == j (node id = column index in logits). The true dst score
+    is looked up by its node id, giving exact full-pool ranking.
 
-    Instead, for each positive (src, dst) we build a per-row candidate
-    block of size min(max_candidates, |candidate_pool|), with the true dst
-    fixed at position 0 (so it is always scored) and the remaining slots
-    sampled uniformly at random (with replacement) from candidate_pool.
-    Rank = #candidates with a strictly higher existence score than dst, + 1.
-    Hits@K / MRR are accumulated the same way as _hits_at_k.
+    When max_candidates < |candidate_pool| (sampled mode): builds a per-row
+    candidate block with the true dst fixed at position 0 and the remaining
+    slots sampled uniformly at random (with replacement) from candidate_pool.
 
     dyads_per_chunk controls the CUDA batch size: batch_size = dyads_per_chunk
-    // max_candidates source nodes are scored per call, so the peak tensor in
-    the mixer is (batch_size * max_candidates, 2*max_edges, hidden). The
-    default 9_000 caps this at ~30 * 300 = 9K pairs → ~184 MB at hidden=128,
-    max_edges=20. Unlike _hits_at_k's 1M default (cheap MLP on fixed
-    embeddings), the mixer's memory cost scales with pairs, not just src nodes.
-    Bind a larger value via functools.partial if GPU memory allows it.
-
-    This is a sampled-ranking approximation, not the exact full-pool metric
-    that RGCN/TGAT report — treat STHN's Hits@K/MRR as directionally
-    comparable but not numerically identical to the other baselines.
+    // n_block source nodes are scored per call, capping peak tensor size.
     """
     n_pos = src.numel()
     n_cand = candidate_pool.numel()
@@ -599,6 +586,7 @@ def _hits_at_k_sthn(
         return out
 
     n_block = min(max_candidates, n_cand)
+    full_pool = (n_block >= n_cand)
     n_extra = max(n_block - 1, 0)
     batch_size = max(1, dyads_per_chunk // max(n_block, 1))
 
@@ -612,20 +600,27 @@ def _hits_at_k_sthn(
         sub_dst = dst[start:end]
         B = sub_src.numel()
 
-        if n_extra > 0:
+        if full_pool:
+            # Exact: score every candidate; candidate_pool = arange so pool[j]==j.
+            cand_rep = candidate_pool.unsqueeze(0).expand(B, n_block).reshape(-1)
+        elif n_extra > 0:
             rand_idx = torch.randint(0, n_cand, (B, n_extra), device=h.device)
-            rand_cands = candidate_pool[rand_idx]                  # (B, n_extra)
-            cand_block = torch.cat([sub_dst.unsqueeze(1), rand_cands], dim=1)
+            rand_cands = candidate_pool[rand_idx]
+            cand_rep = torch.cat([sub_dst.unsqueeze(1), rand_cands], dim=1).reshape(-1)
         else:
-            cand_block = sub_dst.unsqueeze(1)
+            cand_rep = sub_dst.unsqueeze(1).reshape(-1)
 
         src_rep = sub_src.unsqueeze(1).expand(B, n_block).reshape(-1)
-        cand_rep = cand_block.reshape(-1)
         t_rep = t_query[start:end].unsqueeze(1).expand(B, n_block).reshape(-1)
         logits = model.existence_logit(h, src_rep, cand_rep, t_rep).view(B, n_block)
 
-        true_scores = logits[:, 0]
-        ranks = (logits > true_scores.unsqueeze(1)).sum(dim=1) + 1
+        if full_pool:
+            # logits[b, j] = score for candidate pool[j] = j; index by dst node id.
+            dst_scores = logits[torch.arange(B, device=h.device), sub_dst]
+            ranks = (logits > dst_scores.unsqueeze(1)).sum(dim=1) + 1
+        else:
+            true_scores = logits[:, 0]
+            ranks = (logits > true_scores.unsqueeze(1)).sum(dim=1) + 1
         for k in ks:
             hits[k] += int((ranks <= k).sum().item())
         reciprocal_rank_sum += float((1.0 / ranks.float()).sum().item())

@@ -514,7 +514,7 @@ def train(
     loss_weights: tuple[float, float, float] = (1.0, 1.0, 1.0),
     device: Optional[str] = None,
     log_every: int = 20,
-    neg_chunk_size: int = 5_000,
+    neg_chunk_size: int = 50_000,
 ) -> dict:
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -634,12 +634,16 @@ def _hits_at_k_tgat(
     dyads_per_chunk: int = 2_048,
     max_candidates: int = 300,
 ) -> dict:
-    """Approximate Hits@K / MRR for TGAT (mirrors _hits_at_k_sthn).
+    """Hits@K / MRR for TGAT.
 
-    For each positive (src, dst, t_query) builds a candidate block of size
-    min(max_candidates, |pool|): true dst at position 0, the rest sampled
-    uniformly from candidate_pool. Both endpoints are embedded per-query via
-    encode_pair_side so causal masking is respected.
+    When max_candidates >= |candidate_pool| (full-pool mode): scores every
+    candidate node exhaustively. candidate_pool must be torch.arange(n_nodes)
+    so that pool[j] == j (node id = column index in logits). The true dst score
+    is looked up by its node id, giving exact full-pool ranking with no inflation
+    from negative sampling.
+
+    When max_candidates < |candidate_pool| (sampled mode): true dst is placed
+    at position 0 and the remaining slots are sampled uniformly with replacement.
     """
     n_pos = src.numel()
     n_cand = candidate_pool.numel()
@@ -649,6 +653,7 @@ def _hits_at_k_tgat(
         return out
 
     n_block = min(max_candidates, n_cand)
+    full_pool = (n_block >= n_cand)
     n_extra = max(n_block - 1, 0)
     batch_size = max(1, dyads_per_chunk // max(n_block, 1))
 
@@ -663,20 +668,27 @@ def _hits_at_k_tgat(
         sub_tq = t_query[start:end]
         B = sub_src.numel()
 
-        if n_extra > 0:
+        if full_pool:
+            # Exact: score every candidate; candidate_pool = arange so pool[j]==j.
+            cand_rep = candidate_pool.unsqueeze(0).expand(B, n_block).reshape(-1)
+        elif n_extra > 0:
             rand_idx = torch.randint(0, n_cand, (B, n_extra), device=h_init.device)
             rand_cands = candidate_pool[rand_idx]
-            cand_block = torch.cat([sub_dst.unsqueeze(1), rand_cands], dim=1)
+            cand_rep = torch.cat([sub_dst.unsqueeze(1), rand_cands], dim=1).reshape(-1)
         else:
-            cand_block = sub_dst.unsqueeze(1)
+            cand_rep = sub_dst.unsqueeze(1).reshape(-1)
 
         src_rep = sub_src.unsqueeze(1).expand(B, n_block).reshape(-1)
-        cand_rep = cand_block.reshape(-1)
         t_rep = sub_tq.unsqueeze(1).expand(B, n_block).reshape(-1)
         logits = model.existence_logit(h_init, src_rep, cand_rep, t_rep).view(B, n_block)
 
-        true_scores = logits[:, 0]
-        ranks = (logits > true_scores.unsqueeze(1)).sum(dim=1) + 1
+        if full_pool:
+            # logits[b, j] = score for candidate pool[j] = j; index by dst node id.
+            dst_scores = logits[torch.arange(B, device=h_init.device), sub_dst]
+            ranks = (logits > dst_scores.unsqueeze(1)).sum(dim=1) + 1
+        else:
+            true_scores = logits[:, 0]
+            ranks = (logits > true_scores.unsqueeze(1)).sum(dim=1) + 1
         for k in ks:
             hits[k] += int((ranks <= k).sum().item())
         rr_sum += float((1.0 / ranks.float()).sum().item())
