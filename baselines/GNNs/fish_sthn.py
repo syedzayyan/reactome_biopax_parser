@@ -793,8 +793,13 @@ def evaluate(
     compute_hits: bool = False,
     hits_ks: tuple[int, ...] = (1, 10, 100),
     hits_batch: int = 9_000,
+    eval_split: str = "test",
 ) -> dict:
-    """Compute the three task metrics on the held-out test set(s).
+    """Compute the three task metrics on the held-out edge set.
+
+    eval_split : 'test' | 'val'
+        Which mask to evaluate on.  Use 'val' during hyperparameter tuning
+        so the test set is never touched before final evaluation.
 
     Uses per-query temporal causality: each pair (src, dst, t) sees only
     training neighbours with edge_time < t, with t as the reference for time
@@ -810,14 +815,25 @@ def evaluate(
             compute_hits=compute_hits, hits_ks=hits_ks,
             hits_batch=hits_batch,
         )
+
+        if eval_split == "val":
+            if data.val_mask is None or int(data.val_mask.sum()) == 0:
+                raise ValueError(
+                    "eval_split='val' but data.val_mask is empty. "
+                    "Rebuild with val_node_frac > 0."
+                )
+            primary_mask = data.val_mask
+        else:
+            primary_mask = data.test_mask
+
         primary = _score_edge_set_temporal(
-            model, data, h, data.test_mask, n_neg_per_pos, device, seed,
+            model, data, h, primary_mask, n_neg_per_pos, device, seed,
             neg_state=neg_state, **_hits_kw,
         )
         out: dict = dict(primary)
         out["n_test_edges"] = primary["n_edges"]
 
-        if data.inductive_mask is not None and int(data.inductive_mask.sum()) > 0:
+        if eval_split == "test" and data.inductive_mask is not None and int(data.inductive_mask.sum()) > 0:
             inductive = _score_edge_set_temporal(
                 model, data, h, data.inductive_mask, n_neg_per_pos, device, seed + 1,
                 neg_state=neg_state, **_hits_kw,
@@ -833,8 +849,8 @@ def evaluate(
 
         seen_nodes = set(data.all_src[data.train_mask].cpu().numpy().tolist())
         seen_nodes |= set(data.all_dst[data.train_mask].cpu().numpy().tolist())
-        src_np = data.all_src[data.test_mask].cpu().numpy()
-        dst_np = data.all_dst[data.test_mask].cpu().numpy()
+        src_np = data.all_src[primary_mask].cpu().numpy()
+        dst_np = data.all_dst[primary_mask].cpu().numpy()
         out["test_both_endpoints_seen"] = sum(
             1 for s, d in zip(src_np, dst_np) if s in seen_nodes and d in seen_nodes
         )

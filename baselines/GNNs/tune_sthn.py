@@ -105,7 +105,6 @@ def make_objective(G, args, device):
         data = build_dataset(
             G,
             split="semi_inductive",
-            unseen_node_frac=0.20,
             order_mode="coral",
             n_order_bins=20,
             time_target=time_target,
@@ -139,7 +138,7 @@ def make_objective(G, args, device):
                   device=device, log_every=trial_epochs)
 
             m = evaluate(model, data, device=device, seed=fixed_seed,
-                         compute_hits=True)
+                         compute_hits=True, eval_split="val")
         except torch.cuda.OutOfMemoryError:
             # The mixer encodes every (src, dst) pair + its 20 negatives as a
             # full sequence through a Transformer in one un-batched call, so

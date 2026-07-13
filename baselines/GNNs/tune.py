@@ -123,7 +123,6 @@ def make_objective(G, args, device):
         data = build_dataset(
             G,
             split="semi_inductive",
-            unseen_node_frac=0.20,
             order_mode="coral",
             n_order_bins=20,
             time_target=time_target,
@@ -152,7 +151,7 @@ def make_objective(G, args, device):
 
         # Evaluate with Hits@K so the multi-task score has retrieval info.
         m = evaluate(model, data, device=device, seed=fixed_seed,
-                     compute_hits=True)
+                     compute_hits=True, eval_split="val")
         score = multi_task_score(m)
 
         # Print a one-line summary in metric space, so the trace is readable.

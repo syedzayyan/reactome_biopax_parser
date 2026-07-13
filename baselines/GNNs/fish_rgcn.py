@@ -156,6 +156,10 @@ class FISHData:
     all_time: torch.Tensor                        # (E,) float
     train_mask: torch.Tensor                      # (E,) bool
     test_mask: torch.Tensor                       # (E,) bool
+    # Validation mask: bridge edges where one endpoint is in the val-unseen
+    # node set (15% of nodes).  Used only during hyperparameter tuning so that
+    # the test set is never touched during model selection.
+    val_mask: Optional[torch.Tensor] = None       # (E,) bool
     # Inductive test mask: edges with neither endpoint seen during training.
     # Populated only by the semi-inductive split; otherwise all-False. Lets
     # these otherwise-discarded edges contribute a separate "feature-only"
@@ -203,7 +207,8 @@ def build_dataset(
     G,
     split: str = "temporal",
     test_frac: float = 0.20,
-    unseen_node_frac: float = 0.20,
+    unseen_node_frac: float = 0.15,
+    val_node_frac: float = 0.15,
     order_mode: str = "regression",
     n_order_bins: int = 20,
     embed_dim_fallback: int = 64,
@@ -227,7 +232,12 @@ def build_dataset(
     test_frac : float
         Used by 'temporal'. Fraction of edges (by time) held out.
     unseen_node_frac : float
-        Used by 'semi_inductive'. Fraction of nodes marked unseen.
+        Used by 'semi_inductive'. Fraction of nodes held out as the **test**
+        unseen set (default 0.15, i.e. 15% test + 15% val + 70% train).
+    val_node_frac : float
+        Used by 'semi_inductive'. Fraction of nodes held out as the **validation**
+        unseen set (default 0.15). Tuners evaluate on val_mask; final test
+        scripts evaluate on test_mask so the test set is never seen during tuning.
     order_mode : 'regression' | 'corn' | 'coral'
     n_order_bins : int
     embed_dim_fallback : int
@@ -322,21 +332,28 @@ def build_dataset(
         cut_time = sorted_steps[cut_idx]
         train_mask_np = times <= cut_time
         test_mask_np = ~train_mask_np
+        val_mask_np = np.zeros_like(train_mask_np)    # unused for temporal
         inductive_mask_np = np.zeros_like(train_mask_np)  # unused
     else:  # 'semi_inductive'
-        # Hold out a random fraction of nodes as unseen. Training edges are
-        # those with both endpoints seen. Test edges are bridge edges with
-        # exactly one seen endpoint; edges with neither endpoint seen are
-        # discarded since they cannot be scored against any training context.
+        # 3-way node split: 70% train / 15% val-unseen / 15% test-unseen.
+        # Training edges: both endpoints in the seen set.
+        # Val edges: exactly one endpoint in val-unseen, the other in seen-only.
+        # Test edges: exactly one endpoint in test-unseen, the other in seen-only.
+        # Edges where neither endpoint is seen-only form the inductive set.
+        # Hyperparameter tuners must evaluate on val_mask; final test scripts
+        # on test_mask so the test set is never seen during model selection.
         n_total_nodes = len(nodes)
-        n_unseen = int(round(unseen_node_frac * n_total_nodes))
+        n_val = int(round(val_node_frac * n_total_nodes))
+        n_test = int(round(unseen_node_frac * n_total_nodes))
 
-        # Load or save the unseen-node set via a shared cache file so that
+        # Load or save the node-split sets via a shared cache file so that
         # separate model scripts (RGCN, TGAT, STHN) use identical splits.
         # Cache is skipped when force_unseen is set (caller controls the set).
         # Node names (not indices) are stored so the cache survives graph
         # reloads where insertion order might vary across Python runs.
-        unseen_ids: Optional[set] = None
+        # Cache format: {"<seed>": {"val": [...names...], "test": [...names...]}}
+        val_ids: Optional[set] = None
+        test_ids: Optional[set] = None
         if split_cache is not None and not force_unseen:
             import json as _json, pathlib as _pathlib
             _cache_path = _pathlib.Path(split_cache)
@@ -344,19 +361,30 @@ def build_dataset(
                 _cached = _json.loads(_cache_path.read_text())
                 _seed_key = str(seed)
                 if _seed_key in _cached:
-                    _missing = [_n for _n in _cached[_seed_key] if _n not in node_to_id]
-                    if _missing:
-                        raise KeyError(
-                            f"split_cache seed={seed}: {len(_missing)} node(s) not found "
-                            f"in current graph (first: {_missing[0]!r}). "
-                            f"Ensure all models parse the same BioPAX / pickle."
+                    _entry = _cached[_seed_key]
+                    if isinstance(_entry, list):
+                        print(
+                            f"[build_dataset] WARNING: {split_cache} contains old "
+                            f"single-group format for seed={seed}. Ignoring and "
+                            f"regenerating the 3-way split."
                         )
-                    unseen_ids = {node_to_id[_n] for _n in _cached[_seed_key]}
-                    print(f"[build_dataset] Loaded split for seed={seed} from {split_cache}")
+                    else:
+                        _missing_val = [_n for _n in _entry["val"] if _n not in node_to_id]
+                        _missing_test = [_n for _n in _entry["test"] if _n not in node_to_id]
+                        if _missing_val or _missing_test:
+                            raise KeyError(
+                                f"split_cache seed={seed}: nodes not found in current graph "
+                                f"(val: {_missing_val[:3]}, test: {_missing_test[:3]}). "
+                                f"Ensure all models parse the same BioPAX / pickle."
+                            )
+                        val_ids = {node_to_id[_n] for _n in _entry["val"]}
+                        test_ids = {node_to_id[_n] for _n in _entry["test"]}
+                        print(f"[build_dataset] Loaded 3-way split for seed={seed} from {split_cache}")
 
-        if unseen_ids is None:
+        if val_ids is None:
             perm = rng.permutation(n_total_nodes)
-            unseen_ids = set(perm[:n_unseen].tolist())
+            val_ids = set(perm[:n_val].tolist())
+            test_ids = set(perm[n_val:n_val + n_test].tolist())
             if split_cache is not None and not force_unseen:
                 import json as _json, pathlib as _pathlib
                 _cache_path = _pathlib.Path(split_cache)
@@ -364,13 +392,15 @@ def build_dataset(
                 _existing: dict = {}
                 if _cache_path.exists():
                     _existing = _json.loads(_cache_path.read_text())
-                _existing[str(seed)] = [str(nodes[i]) for i in sorted(unseen_ids)]
+                _existing[str(seed)] = {
+                    "val": [str(nodes[i]) for i in sorted(val_ids)],
+                    "test": [str(nodes[i]) for i in sorted(test_ids)],
+                }
                 _cache_path.write_text(_json.dumps(_existing, indent=2))
-                print(f"[build_dataset] Saved split for seed={seed} to {split_cache}")
+                print(f"[build_dataset] Saved 3-way split for seed={seed} to {split_cache}")
 
         # Union in any explicitly-requested nodes (e.g. case-study targets).
-        # If a name doesn't resolve, raise — silently dropping a case-study
-        # target would be a hard-to-detect bug.
+        # These go into the test set so they're always evaluated, not tuned on.
         if force_unseen:
             missing = [n for n in force_unseen if n not in node_to_id]
             if missing:
@@ -379,23 +409,31 @@ def build_dataset(
                     + (f" (and {len(missing) - 5} more)" if len(missing) > 5 else "")
                 )
             for n in force_unseen:
-                unseen_ids.add(node_to_id[n])
+                nid = node_to_id[n]
+                val_ids.discard(nid)   # move to test if accidentally in val
+                test_ids.add(nid)
 
-        src_seen = np.array([s not in unseen_ids for s in src])
-        dst_seen = np.array([d not in unseen_ids for d in dst])
-        both_seen = src_seen & dst_seen
-        one_seen = src_seen ^ dst_seen
-        neither_seen = (~src_seen) & (~dst_seen)
-        # Train = both endpoints seen; semi-inductive test = exactly one
-        # endpoint unseen; inductive test = neither endpoint seen (these
-        # edges are scored from node features alone — no graph context).
-        train_mask_np = both_seen
-        test_mask_np = one_seen
-        inductive_mask_np = neither_seen
-        if neither_seen.any():
-            print(f"[build_dataset] semi-inductive: {int(neither_seen.sum())} "
-                  f"edges with both endpoints unseen are promoted to the "
-                  f"inductive test set (no graph context — feature-only).")
+        all_unseen = val_ids | test_ids
+        src_seen_only = np.array([s not in all_unseen for s in src])
+        dst_seen_only = np.array([d not in all_unseen for d in dst])
+        src_in_val = np.array([s in val_ids for s in src])
+        dst_in_val = np.array([d in val_ids for d in dst])
+        src_in_test = np.array([s in test_ids for s in src])
+        dst_in_test = np.array([d in test_ids for d in dst])
+
+        # Strict node-disjoint split: both endpoints of an edge must belong
+        # to the same node-partition.  Bridge edges (one endpoint train, one
+        # val/test) are excluded from all evaluation to avoid leakage.
+        train_mask_np = src_seen_only & dst_seen_only
+        val_mask_np   = src_in_val   & dst_in_val
+        test_mask_np  = src_in_test  & dst_in_test
+        # Remaining edges span node-partitions — not used for training or eval.
+        inductive_mask_np = np.zeros(len(src), dtype=bool)
+
+        print(f"[build_dataset] 3-way node-disjoint split seed={seed}: "
+              f"train={int(train_mask_np.sum())} val={int(val_mask_np.sum())} "
+              f"test={int(test_mask_np.sum())} "
+              f"dropped_bridge={int((~train_mask_np & ~val_mask_np & ~test_mask_np).sum())}")
 
     # Ordinal bins (always computed; the head may or may not use them).
     bins = None
@@ -514,6 +552,7 @@ def build_dataset(
         all_time=torch.from_numpy(times.astype(np.float32)),
         train_mask=torch.from_numpy(train_mask_np),
         test_mask=torch.from_numpy(test_mask_np),
+        val_mask=torch.from_numpy(val_mask_np),
         inductive_mask=torch.from_numpy(inductive_mask_np),
         order_bin=torch.from_numpy(bins.astype(np.int64)) if bins is not None else None,
         order_target=torch.from_numpy(order_target_np),
@@ -1303,18 +1342,21 @@ def evaluate(
     compute_hits: bool = False,
     hits_ks: tuple[int, ...] = (1, 10, 100),
     hits_batch: int = 2048,
+    eval_split: str = "test",
 ) -> dict:
     """
-    Compute the three task metrics on the held-out test set(s).
+    Compute the three task metrics on the held-out edge set.
 
-    Returns metrics keyed by ``{metric}`` for the primary test mask
-    (semi-inductive bridge edges, the original protocol). When an
-    inductive set exists (semi_inductive split with both-endpoints-unseen
-    edges), additionally reports ``ind_{metric}`` from those edges.
+    eval_split : 'test' | 'val'
+        Which mask to evaluate on.  Use 'val' during hyperparameter tuning
+        so the test set is never touched before final evaluation.
 
-    When ``compute_hits=True``, Hits@K is also computed against both an
-    all-nodes pool and a type-matched pool. Costly (~minutes per call on
-    Immune-sized graphs) so off by default.
+    Returns metrics keyed by ``{metric}`` for the primary mask.  When
+    eval_split='test' and an inductive set exists, additionally reports
+    ``ind_{metric}`` from those edges.
+
+    When ``compute_hits=True``, Hits@K / MRR are also computed against the
+    full node pool. Costly (~minutes per call on Immune-sized graphs).
     """
     with torch.no_grad():
         return _evaluate_impl(
@@ -1322,6 +1364,7 @@ def evaluate(
             compute_hits=compute_hits,
             hits_ks=hits_ks,
             hits_batch=hits_batch,
+            eval_split=eval_split,
         )
 
 
@@ -1332,6 +1375,7 @@ def _evaluate_impl(
     hits_ks: tuple[int, ...],
     hits_batch: int,
     hits_fn: Optional[Callable] = None,
+    eval_split: str = "test",
 ) -> dict:
     device = device or next(model.parameters()).device
     model.eval()
@@ -1340,9 +1384,18 @@ def _evaluate_impl(
     # Build smart-negative state once from the training adjacency.
     neg_state = _build_negative_sampler_state(data)
 
-    # Primary: semi-inductive (bridge) test set.
+    if eval_split == "val":
+        if data.val_mask is None or int(data.val_mask.sum()) == 0:
+            raise ValueError(
+                "eval_split='val' but data.val_mask is empty. "
+                "Rebuild with val_node_frac > 0."
+            )
+        primary_mask = data.val_mask
+    else:
+        primary_mask = data.test_mask
+
     primary = _score_edge_set(
-        model, data, h, data.test_mask, n_neg_per_pos, device, seed,
+        model, data, h, primary_mask, n_neg_per_pos, device, seed,
         neg_state=neg_state,
         compute_hits=compute_hits, hits_ks=hits_ks, hits_batch=hits_batch,
         hits_fn=hits_fn,
@@ -1350,8 +1403,8 @@ def _evaluate_impl(
     out: dict = dict(primary)
     out["n_test_edges"] = primary["n_edges"]
 
-    # Secondary: inductive (both-unseen) test set, when present.
-    if data.inductive_mask is not None and int(data.inductive_mask.sum()) > 0:
+    # Secondary: inductive (both-unseen) set, only when evaluating on test.
+    if eval_split == "test" and data.inductive_mask is not None and int(data.inductive_mask.sum()) > 0:
         inductive = _score_edge_set(
             model, data, h, data.inductive_mask, n_neg_per_pos, device, seed + 1,
             neg_state=neg_state,
@@ -1370,8 +1423,8 @@ def _evaluate_impl(
     # Cold-start diagnostic on the primary set.
     seen_nodes = set(data.all_src[data.train_mask].cpu().numpy().tolist())
     seen_nodes |= set(data.all_dst[data.train_mask].cpu().numpy().tolist())
-    src_np = data.all_src[data.test_mask].cpu().numpy()
-    dst_np = data.all_dst[data.test_mask].cpu().numpy()
+    src_np = data.all_src[primary_mask].cpu().numpy()
+    dst_np = data.all_dst[primary_mask].cpu().numpy()
     both_seen = sum(1 for s, d in zip(src_np, dst_np)
                     if s in seen_nodes and d in seen_nodes)
     one_seen = sum(1 for s, d in zip(src_np, dst_np)

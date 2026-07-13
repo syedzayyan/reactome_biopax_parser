@@ -418,7 +418,6 @@ def main():
             mode: build_dataset(
                 G,
                 split="semi_inductive",
-                unseen_node_frac=0.20,
                 order_mode=mode,
                 n_order_bins=args.n_order_bins,
                 compartment_embeddings=compartment_embeddings,
